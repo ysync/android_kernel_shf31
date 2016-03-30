@@ -19,8 +19,8 @@
 
 #include <sharp/shdisp_dsi.h>
 #include "mdss_fb.h"
-#include <mdss_dsi.h>
-#include <mdss_mdp.h>
+#include "mdss_dsi.h"
+#include "mdss_mdp.h"
 #include <linux/iopoll.h>
 
 #define MDSS_DIAG_MIPI_CHECK_AMP_OFF   0x0580
