@@ -17,14 +17,14 @@
 /* SHARP DISPLAY DRIVER FOR KERNEL MODE                                      */
 /* ------------------------------------------------------------------------- */
 
-#include <mdss_shdisp.h>
+#include "mdss_shdisp.h"
 #include <linux/types.h>
 #include <mach/board.h>
 #include <sharp/shdisp_kerl.h>
 #include <sharp/shdisp_dsi.h>
 #include "mdss_fb.h"
-#include <mdss_dsi.h>
-#include <mdss_mdp.h>
+#include "mdss_dsi.h"
+#include "mdss_mdp.h"
 
 
 

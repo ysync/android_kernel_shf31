@@ -29,7 +29,7 @@
 #include <linux/slab.h>
 
 #ifdef CONFIG_SHSYS_CUST
-#include <../../kernel/power/power.h>
+#include "../../../kernel/power/power.h"
 #include <linux/suspend.h>
 #endif /* CONFIG_SHSYS_CUST */
 
