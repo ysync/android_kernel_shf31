@@ -61,18 +61,16 @@ int shdisp_exc_LCD_bkl_on(int param)
     if(shdisp_device_state == SHDISP_DEVICE_STATE_SUBDISP_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_SUBDISP_ON) {
         shdisp_exc_request_state = SHDISP_EXC_REQUEST_BKL_SUBDISP_ON;
     }
-    if(shdisp_device_state == SHDISP_DEVICE_STATE_SUBDISP_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_BKL_SUBDISP_ON) {
-        shdisp_exc_request_state = SHDISP_EXC_REQUEST_BKL_SUBDISP_ON;
-    }
 
     switch(shdisp_exc_request_state) {
     case SHDISP_EXC_REQUEST_BKL_ON:
         shdisp_bdic_API_LCD_BKL_fix_on(param);
+        shdisp_device_state = SHDISP_DEVICE_STATE_BKL_ON;
+        shdisp_kerl_ctx.main_bkl.mode  = SHDISP_MAIN_BKL_MODE_FIX;
         break;
+
     case SHDISP_EXC_REQUEST_BKL_SUBDISP_ON:
-        shdisp_subdisplay_API_disp_off();
-        shdisp_subdisplay_API_power_off();
-        shdisp_bdic_API_LCD_BKL_fix_on(param);
+        SHDISP_TRACE("subdisplay is on,backlight can't be on\n");
         break;
     default:
         SHDISP_ERR("%s: error state\n",__func__);
@@ -80,7 +78,6 @@ int shdisp_exc_LCD_bkl_on(int param)
     }
 
     shdisp_param = param;
-    shdisp_device_state = SHDISP_DEVICE_STATE_BKL_ON;
     SHDISP_TRACE("out2:DS = %d,RS = %d\n",shdisp_device_state,shdisp_exc_request_state);
     return SHDISP_RESULT_SUCCESS;
 }
@@ -98,9 +95,6 @@ int shdisp_exc_LCD_bkl_off(void)
     if(shdisp_device_state == SHDISP_DEVICE_STATE_BKL_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_BKL_ON) {
         shdisp_exc_request_state = SHDISP_EXC_REQUEST_BKL_SUBDISP_OFF;
     }
-    if(shdisp_device_state == SHDISP_DEVICE_STATE_BKL_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_BKL_SUBDISP_ON) {
-        shdisp_exc_request_state = SHDISP_EXC_REQUEST_SUBDISP_ON;
-    }
     if(shdisp_device_state == SHDISP_DEVICE_STATE_SUBDISP_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_BKL_SUBDISP_ON) {
         shdisp_exc_request_state = SHDISP_EXC_REQUEST_SUBDISP_ON;
         SHDISP_TRACE("out2:DS = %d,RS = %d\n",shdisp_device_state,shdisp_exc_request_state);
@@ -110,13 +104,8 @@ int shdisp_exc_LCD_bkl_off(void)
     switch(shdisp_exc_request_state) {
     case SHDISP_EXC_REQUEST_BKL_SUBDISP_OFF:
         shdisp_bdic_API_LCD_BKL_off();
+        shdisp_kerl_ctx.main_bkl.mode  = SHDISP_MAIN_BKL_MODE_OFF;
         shdisp_device_state = SHDISP_DEVICE_STATE_ALL_OFF;
-        break;
-    case SHDISP_EXC_REQUEST_SUBDISP_ON:
-        shdisp_bdic_API_LCD_BKL_off();
-        shdisp_subdisplay_API_power_on();
-        shdisp_subdisplay_API_disp_on();
-        shdisp_device_state = SHDISP_DEVICE_STATE_SUBDISP_ON;
         break;
     default:
         SHDISP_ERR("%s: error state\n",__func__);
@@ -140,9 +129,6 @@ int shdisp_exc_subdisplay_on(void)
         shdisp_exc_request_state = SHDISP_EXC_REQUEST_SUBDISP_ON;
     }
     if(shdisp_device_state == SHDISP_DEVICE_STATE_BKL_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_BKL_ON) {
-        shdisp_exc_request_state = SHDISP_EXC_REQUEST_BKL_SUBDISP_ON;
-    }
-    if(shdisp_device_state == SHDISP_DEVICE_STATE_BKL_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_BKL_SUBDISP_ON) {
         shdisp_exc_request_state = SHDISP_EXC_REQUEST_BKL_SUBDISP_ON;
     }
 
@@ -180,11 +166,6 @@ int shdisp_exc_subdisplay_off(void)
     }
     if(shdisp_device_state == SHDISP_DEVICE_STATE_SUBDISP_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_BKL_SUBDISP_ON) {
         shdisp_exc_request_state = SHDISP_EXC_REQUEST_BKL_ON;
-    }
-    if(shdisp_device_state == SHDISP_DEVICE_STATE_BKL_ON && shdisp_exc_request_state == SHDISP_EXC_REQUEST_BKL_SUBDISP_ON) {
-        shdisp_exc_request_state = SHDISP_EXC_REQUEST_BKL_ON;
-        SHDISP_TRACE("out2:DS = %d,RS = %d\n",shdisp_device_state,shdisp_exc_request_state);
-        return SHDISP_RESULT_SUCCESS;
     }
 
     switch(shdisp_exc_request_state) {

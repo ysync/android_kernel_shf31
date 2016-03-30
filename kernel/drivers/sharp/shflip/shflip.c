@@ -22,6 +22,9 @@
 #include <linux/slab.h>
 #include <sharp/shtrpd_dev.h>
 #include <linux/wakelock.h>
+#ifdef CONFIG_SHTERM
+#include <sharp/shterm_k.h>
+#endif /* CONFIG_SHTERM */
 
 #define SHFLIP_LOG_TAG "SHFLIPSWITCH"
 
@@ -107,12 +110,18 @@ irqreturn_t sh_flip_irq_thread(int irq, void *dev_id)
 		input_report_switch(input, SW_LID, 0);
 		switch_set_state(&fd->sdev_flip, value);
 		msm_trpd_set_flip_state(1);
+#ifdef CONFIG_SHTERM
+		shterm_flip_status_set(SHTERM_FLIP_STATE_OPEN);
+#endif /* CONFIG_SHTERM */
 	}
 	else if(value == FLIP_CLOSE) {
 		printk("flip: close\n");
 		input_report_switch(input, SW_LID, 1);
 		switch_set_state(&fd->sdev_flip, value);
 		msm_trpd_set_flip_state(0);
+#ifdef CONFIG_SHTERM
+		shterm_flip_status_set(SHTERM_FLIP_STATE_CLOSE);
+#endif /* CONFIG_SHTERM */
 	}
 
 	input_sync(input);

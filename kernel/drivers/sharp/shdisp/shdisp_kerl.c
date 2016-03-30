@@ -3265,7 +3265,6 @@ static int shdisp_SQE_main_bkl_ctl(int type, struct shdisp_main_bkl_ctl *bkl)
         break;
     }
 
-    shdisp_kerl_ctx.main_bkl.mode  = request.mode;
     shdisp_kerl_ctx.main_bkl.param = request.param;
 
 #ifdef CONFIG_SHTERM
@@ -5778,11 +5777,13 @@ static int shdisp_proc_write(struct file *file, const char *buffer, unsigned lon
         break;
     case SHDISP_DEBUG_EXC_LCD_BLK_ON:
         printk("%s: SHDISP_DEBUG_EXC_LCD_BLK_ON\n",__func__);
-        shdisp_exc_LCD_bkl_on(90);
+        bkl.param = 90;
+        bkl.mode = SHDISP_MAIN_BKL_MODE_FIX;
+        shdisp_api_main_bkl_on(&bkl);
         break;
     case SHDISP_DEBUG_EXC_LCD_BLK_OFF:
         printk("%s: SHDISP_DEBUG_EXC_LCD_BLK_OFF\n",__func__);
-        shdisp_exc_LCD_bkl_off();
+        shdisp_api_main_bkl_off();
         break;
 #endif
     default:

@@ -63,6 +63,8 @@
 #define PM_ATI_COMP         0x23    /*  Read / Write    */
 #define PM_ATI_SETTINGS     0x24    /*  Write   */
 
+#define REATI_TEMP_DRIFT    0x40    /*  Write   */
+
 /*  BIT DEFINITIONS FOR SHTRPD  */
 /*  XYInfoByte0 */
 /*  Indicates how many co-ordinates are available   */
@@ -125,6 +127,7 @@
 #define NM_LTA_HALT         0x04
 #define PM_LTA_HALT         0x08
 #define ATIC_ADJ_DISABLE    0x10
+#define TEMP_DRIFT_MODE     0x40
 
 /*  Bit definitions - FilterSettings0   */
 /*  0=enabled    1=disabled */

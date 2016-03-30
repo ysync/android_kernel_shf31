@@ -20,6 +20,7 @@
 #include <linux/input/mt.h>
 #include <linux/miscdevice.h>
 #include <linux/ioctl.h>
+#include <linux/wakelock.h>
 #include <asm/uaccess.h>
 #include "sharp/shflip_dev.h"
 #include "sharp/sh_boot_manager.h"
@@ -57,6 +58,7 @@
 #define SHTRPD_INTERRUPT_TIMING_CHECK_ENABLE
 #define SHTRPD_SNAP_USER_MASK
 #define SHTRPD_CHECK_CPU_TEMP_ENABLE
+#define SHTRPD_INTOUCH_GHOST_REJECTION_ENABLE
 
 #if defined(SHTRPD_TOUCH_UP_DELAY_ENABLE)
 	#define SHTRPD_FAIL_FLICK_RECOVER_ENABLE
@@ -101,6 +103,7 @@
 #define SHTRPDIO_SET_TOUCHEVENT _IOW (SHTRPDIO, 14 , int)
 #define SHTRPDIO_SET_REATI      _IO  (SHTRPDIO,  15)
 #define SHTRPDIO_SET_KEYMODE    _IOW (SHTRPDIO, 16, int)
+#define SHTRPDIO_SET_TOUCHCRUISER _IOW ( SHTRPDIO,  17, int)
 
 #define SHTRPD_SNAP_OFF_ON      1
 #define SHTRPD_SNAP_ON_ON       2
@@ -184,6 +187,7 @@
 #define SHTRPD_PROPERTY_ACTIVECHANNELS  8
 #define SHTRPD_PROPERTY_DEBOUNCE        9
 #define SHTRPD_PROPERTY_PMATI           10
+#define SHTRPD_PROPERTY_TEMPDRIFT       11
 
 #define SHTRDP_HW_REVISION_ES0          0
 #define SHTRDP_HW_REVISION_ES1          1
@@ -280,8 +284,10 @@ int shtrpd_flip_old_state   = 0;
 static int shtrpd_fwdl_fail_flg = 0;
 #endif /* SHTRPD_ENABLE_INIT_FW_DL */
 
+static int shtrpd_touchcruiser_state = 0;
+
 struct shtrpd_property_type {
-    u8   controlsetting_val[3];
+    u8   controlsetting_val[4];
 
     u8   proxthreshold_val;
     u8   touchmultiplier_val;
@@ -330,6 +336,10 @@ struct shtrpd_property_type {
     u16  pmatitarget_val;
     u8   pmatic_val;
     u8   pm_re_ati_range;
+
+    u8   temp_non_detect_avg;
+    u8   temp_min_delta;
+    u8   temp_lta_adj_interval;
 };
 
 struct shtrpd_property_type shtrpd_properties;
@@ -619,8 +629,9 @@ static struct shtrpd_tu_jitter_filter_info tu_jitter_filter[MAX_TOUCHES];
 static DEFINE_MUTEX(shtrpd_cpu_idle_sleep_ctrl_lock);
 
 struct shtrpd_idle_sleep_ctrl_info{
-		struct pm_qos_request		qos_cpu_latency;
-		int							wake_lock_idle_state;
+	struct wake_lock            wake_lock;
+	struct pm_qos_request		qos_cpu_latency;
+	int							wake_lock_idle_state;
 };
 static struct shtrpd_idle_sleep_ctrl_info idle_sleep_ctrl_info;
 #endif /* SHTRPD_CPU_IDLE_SLEEP_CONTROL_ENABLE */
@@ -854,6 +865,9 @@ static int fail_touch_clear_reati_req = 0;
 #endif /* SHTRPD_FAIL_TOUCH_CLEAR_ENABLE */
 
 int shtrpd_touchmultiplier_val   = TOUCHMULTIPLIER_VAL;
+int shtrpd_touchshifter_val      = TOUCHSHIFTER_VAL;
+int shtrpd_touchmultiplier2_val  = TOUCHMULTIPLIER2_VAL;
+int shtrpd_touchshifter2_val     = TOUCHSHIFTER2_VAL;
 int shtrpd_intouchmultiplier_val = INTOUCHMULTIPLIER_VAL;
 int shtrpd_snapthreshold_val     = SNAPTHRESHOLD_VAL;
 int shtrpd_proxthreshold_flipclose_val     = 0xFF;
@@ -867,6 +881,7 @@ int shtrpd_handshake_wait        = SHTRPD_HANDSHAKE_DELAY;
 
 int shtrpd_atic_adj_disable = 0;
 int shtrpd_atic_adj_wait    = SHTRPD_ATIC_ADJ_DELAY;
+int shtrpd_temp_drift       = 1;
 
 #if defined(SHTRPD_NOINTERRUPT_IN_TOUCH_CHECK_ENABLE)
 SHTRPD_PARAM_DEF( SHTRPD_NOINTERRUPT_IN_TOUCH_CHECK_DELAY,		5000);
@@ -933,15 +948,64 @@ module_param(shtrpd_snap_keymode,  int, 0600);
 #if defined( SHTRPD_CHECK_CPU_TEMP_ENABLE )
 #define SHTRPD_CPU_TEMP_FILE "sys/class/power_supply/shbatt_adc/cpu_temp" 
 
+SHTRPD_PARAM_DEF( SHTRPD_CHECK_CPU_TEMP_INTERVAL,  60000);
+
 int SHTRPD_CHECK_CPU_TEMP = 0;
-SHTRPD_PARAM_DEF( SHTRPD_CHECK_CPU_TEMP_HIGH_VAL,		47);
-SHTRPD_PARAM_DEF( SHTRPD_CHECK_CPU_TEMP_LOW_VAL,		45);
-SHTRPD_PARAM_DEF( SHTRPD_CHECK_CPU_TEMP_SNAP_THRESHOLD_VAL,	250);
+int shtrpd_new_snap_threshold = SNAPTHRESHOLD_VAL;
+int shtrpd_new_touchmultiplier_val = TOUCHMULTIPLIER_VAL;
+int shtrpd_new_touchshifter_val = TOUCHSHIFTER_VAL;
+int shtrpd_new_touchmultiplier2_val = TOUCHMULTIPLIER2_VAL;
+int shtrpd_new_touchshifter2_val = TOUCHSHIFTER2_VAL;
+int shtrpd_new_intouchmultiplier_val = INTOUCHMULTIPLIER_VAL;
+int shtrpd_old_cpu_temp = -9999;
 
-int shtrpd_write_cpu_temp_high_val_flg = 0;
-int shtrpd_write_cpu_temp_low_val_flg  = 0;
+static struct delayed_work shtrpd_work_cpu_temp;
 
-static struct work_struct shtrpd_work_cpu_temp;
+struct shtrpd_snap_thresh_tbl_info {
+	int temp;
+	int snap_threshold;
+	int touch_multiplier_val;
+	int touch_shifter_val;
+	int touch_multiplier2_val;
+	int touch_shifter2_val;
+	int in_touch_multiplier_val;
+};
+
+static struct shtrpd_snap_thresh_tbl_info SHTRPD_UP_TEMP_SNAP_THRESH_TBL[] =
+{
+	{  -4, 310, 25, 7, 32, 7, 20 },
+	{  39, 310, 20, 7, 25, 7, 16 },
+	{  45, 310, 16, 7, 20, 7, 12 },
+	{  49, 250, 16, 7, 20, 7, 12 },
+	{  54, 250, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+};
+static const int SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE = 
+	sizeof(SHTRPD_UP_TEMP_SNAP_THRESH_TBL) / sizeof(struct shtrpd_snap_thresh_tbl_info);
+
+static struct shtrpd_snap_thresh_tbl_info SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[] =
+{
+	{  -5, 310, 25, 7, 32, 7, 20 },
+	{  38, 310, 20, 7, 25, 7, 16 },
+	{  44, 310, 16, 7, 20, 7, 12 },
+	{  48, 250, 16, 7, 20, 7, 12 },
+	{  53, 250, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+	{ 999, 200, 11, 7, 15, 7, 9  },
+};
+static const int SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE = 
+	sizeof(SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL) / sizeof(struct shtrpd_snap_thresh_tbl_info);
 
 #if defined( SHTRPD_LOG_DEBUG_ENABLE )
     SHTRPD_PARAM_DEF( SHTRPD_CHECK_CPU_TEMP_LOG_ENABLE, 	0);
@@ -953,6 +1017,32 @@ static struct work_struct shtrpd_work_cpu_temp;
 	#define	SHTRPD_LOG_CHECK_CPU_TEMP(...)
 #endif /* SHTRPD_LOG_DEBUG_ENABLE */
 #endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
+
+#ifdef SHTRPD_INTOUCH_GHOST_REJECTION_ENABLE
+SHTRPD_PARAM_DEF( SHTRPD_INTOUCH_GHOST_REJECT_ENABLE,          1);
+SHTRPD_PARAM_DEF( SHTRPD_INTOUCH_GHOST_REJECT_Z_THRESH,        650);
+SHTRPD_PARAM_DEF( SHTRPD_INTOUCH_GHOST_REJECT_ZRATIO_THRESH,   20);
+SHTRPD_PARAM_DEF( SHTRPD_INTOUCH_GHOST_REJECT_MOVE_THRESH,     10);
+SHTRPD_PARAM_DEF( SHTRPD_INTOUCH_GHOST_REJECT_AREA_MAX,        2);
+
+struct shtrpd_filter_intouch_ghost_reject_info{
+	u8						is_ghost;
+	u16						td_x;
+	u16						td_y;
+};
+static struct shtrpd_filter_intouch_ghost_reject_info intouch_ghost_reject[MAX_TOUCHES];
+
+#if defined( SHTRPD_LOG_DEBUG_ENABLE )
+    SHTRPD_PARAM_DEF( SHTRPD_INTOUCH_GHOST_REJECT_LOG_ENABLE, 	0);
+    #define	SHTRPD_LOG_INTOUCH_GHOST_REJECT(...) \
+        if(SHTRPD_INTOUCH_GHOST_REJECT_LOG_ENABLE != 0){	\
+            printk(KERN_DEBUG "[shtrpd] [intouch_ghost_reject]" __VA_ARGS__);	\
+        }
+#else
+	#define	SHTRPD_LOG_INTOUCH_GHOST_REJECT(...)
+#endif /* SHTRPD_LOG_DEBUG_ENABLE */
+
+#endif /* SHTRPD_INTOUCH_GHOST_REJECTION_ENABLE */
 
 int shtrpd_err_log  = 1;
 int shtrpd_warn_log = 0;
@@ -988,6 +1078,7 @@ module_param(shtrpd_lptime_flipclose_val, int, 0600);
 
 module_param(shtrpd_atic_adj_disable, int, 0600);
 module_param(shtrpd_atic_adj_wait,  int, 0600);
+module_param(shtrpd_temp_drift,  int, 0600);
 
 #if defined (SHTRPD_FAIL_TOUCH_CLEAR_ENABLE)
 module_param(fail_touch_clear_reati_req,  int, 0600);
@@ -1034,7 +1125,8 @@ static int shtrpd_reati(struct shtrpd_ts_data *data);
 static int shtrpd_switch_event_mode(struct shtrpd_ts_data *data, bool event);
 static void shtrpd_reset_setting(void);
 static int shtrpd_flip_close_proc(void);
-static int shtrpd_thresholds_for_flip(struct shtrpd_ts_data *data, u8 enable);
+static int shtrpd_user_thresholds(struct shtrpd_ts_data *data, u8 enable);
+static int shtrpd_user_switch_event_mode(struct shtrpd_ts_data *data, u8 enable);
 
 #if (defined(SHTRPD_INTERRUPT_TIMING_CHECK_ENABLE) || defined(SHTRPD_FAIL_TOUCH_CLEAR_ENABLE))
 static long shtrpd_int_timing_check_reati(void);
@@ -1044,13 +1136,14 @@ static long shtrpd_int_timing_check_reati(void);
 /* ------------------------------------------------------------------------- */
 /* shtrpd_read_cpu_temp_file                                                 */
 /* ------------------------------------------------------------------------- */
-static int shtrpd_read_cpu_temp_file(char *filename, long *temp_p)
+static int shtrpd_read_cpu_temp_file(char *filename, int *temp_p)
 {
     int ret = 0;
     struct file *file;
     mm_segment_t fs;
     char buf[16];
     int nr_read;
+    long cur_temp;
 
     file = filp_open(filename, O_RDONLY, 0); 
 
@@ -1067,7 +1160,8 @@ static int shtrpd_read_cpu_temp_file(char *filename, long *temp_p)
     if(nr_read == 0){
         ret = -1;
     }else{
-        ret = kstrtol(buf, 10, temp_p);
+        ret = kstrtol(buf, 10, &cur_temp);
+        *temp_p = (int)cur_temp;
     }
 
     set_fs(fs);
@@ -1077,119 +1171,183 @@ static int shtrpd_read_cpu_temp_file(char *filename, long *temp_p)
 }
 
 /* ------------------------------------------------------------------------- */
-/* shtrpd_check_cputemp_condition                                            */
+/* shtrpd_get_up_temp_snap_threshold                                         */
 /* ------------------------------------------------------------------------- */
-static int shtrpd_check_cputemp_condition(void)
+static void shtrpd_get_up_temp_snap_threshold(long temp,
+    int *snap, int *mult, int *shift, int *mult2, int *shift2, int *intouch)
 {
-    int ret = 0;
-    long cpu_temp;
-    struct shtrpd_ts_data *data = i2c_get_clientdata(shtrpd_client);
-
-    if(!SHTRPD_CHECK_CPU_TEMP){
-        return 0;
-    }
-
-    if (initialSetup) {
-        SHTRPD_ERR("initialSetup\n");
-        return 0;
-    }
-
-    if(shtrpd_read_cpu_temp_file(SHTRPD_CPU_TEMP_FILE, &cpu_temp) != 0){
-        SHTRPD_ERR("File not found : %s\n", SHTRPD_CPU_TEMP_FILE);
-        return 0;
-    }
-
-    SHTRPD_LOG_CHECK_CPU_TEMP("cpu_temp:%d\n", (int)cpu_temp);
-
-    if(cpu_temp >= SHTRPD_CHECK_CPU_TEMP_HIGH_VAL) {
-        if(!shtrpd_write_cpu_temp_high_val_flg) {
-            SHTRPD_LOG_CHECK_CPU_TEMP("Change SNAPTHRESHOLD High\n")
-            shtrpd_snapthreshold_val = SHTRPD_CHECK_CPU_TEMP_SNAP_THRESHOLD_VAL;
-
-            ret = shtrpd_thresholds_for_flip(data, 1);
-            if(ret < 0) {
-                SHTRPD_ERR("shtrpd_thresholds_for_flip err, ret:%d\n", ret);
-            } else {
-                shtrpd_write_cpu_temp_high_val_flg = 1;
-                shtrpd_write_cpu_temp_low_val_flg = 0;
-            }
+    int i;
+    
+    for(i = 0;i < SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE;i++){
+        if(temp <= SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].temp){
+            *snap   = SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].snap_threshold;
+            *mult   = SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].touch_multiplier_val;
+            *shift  = SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].touch_shifter_val;
+            *mult2  = SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].touch_multiplier2_val;
+            *shift2 = SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].touch_shifter2_val;
+            *intouch= SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].in_touch_multiplier_val;
+            return;
         }
     }
+    
+    *snap   = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE - 1].snap_threshold;
+    *mult   = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE - 1].touch_multiplier_val;
+    *shift  = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE - 1].touch_shifter_val;
+    *mult2  = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE - 1].touch_multiplier2_val;
+    *shift2 = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE - 1].touch_shifter2_val;
+    *intouch= SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE - 1].in_touch_multiplier_val;
+}
 
-    if(cpu_temp < SHTRPD_CHECK_CPU_TEMP_LOW_VAL) {
-        if(!shtrpd_write_cpu_temp_low_val_flg) {
-            SHTRPD_LOG_CHECK_CPU_TEMP("Change SNAPTHRESHOLD Low\n")
-            shtrpd_snapthreshold_val = SNAPTHRESHOLD_VAL_PP2;
-
-            ret = shtrpd_thresholds_for_flip(data, 1);
-            if(ret < 0) {
-                SHTRPD_ERR("shtrpd_thresholds_for_flip err, ret:%d\n", ret);
-            } else {
-                shtrpd_write_cpu_temp_high_val_flg = 0;
-                shtrpd_write_cpu_temp_low_val_flg = 1;
-            }
+/* ------------------------------------------------------------------------- */
+/* shtrpd_get_down_temp_snap_threshold                                       */
+/* ------------------------------------------------------------------------- */
+static void shtrpd_get_down_temp_snap_threshold(long temp,
+    int *snap, int *mult, int *shift, int *mult2, int *shift2, int *intouch)
+{
+    int i;
+    
+    for(i = 0;i < SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE;i++){
+        if(temp <= SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].temp){
+            *snap   = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].snap_threshold;
+            *mult   = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].touch_multiplier_val;
+            *shift  = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].touch_shifter_val;
+            *mult2  = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].touch_multiplier2_val;
+            *shift2 = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].touch_shifter2_val;
+            *intouch= SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].in_touch_multiplier_val;
+            return;
         }
     }
+    
+    *snap   = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE - 1].snap_threshold;
+    *mult   = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE - 1].touch_multiplier_val;
+    *shift  = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE - 1].touch_shifter_val;
+    *mult2  = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE - 1].touch_multiplier2_val;
+    *shift2 = SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE - 1].touch_shifter2_val;
+    *intouch= SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE - 1].in_touch_multiplier_val;
+}
 
-    return 0;
+/* ------------------------------------------------------------------------- */
+/* shtrpd_thresholds_check_thresh_change                                     */
+/* ------------------------------------------------------------------------- */
+static int shtrpd_thresholds_check_thresh_change(int snap, int mult, int shift, int mult2, int shift2, int intouch)
+{
+    if((shtrpd_snapthreshold_val    != snap)   ||
+       (shtrpd_touchmultiplier_val  != mult)   ||
+       (shtrpd_touchshifter_val     != shift)  ||
+       (shtrpd_touchmultiplier2_val != mult2)  ||
+       (shtrpd_touchshifter2_val    != shift2) ||
+       (shtrpd_intouchmultiplier_val!= intouch))
+	{
+		return 1;
+	}
+	
+	return 0;
 }
 
 /* ------------------------------------------------------------------------- */
 /* shtrpd_thresholds_check_cpu_temp                                          */
 /* ------------------------------------------------------------------------- */
-static int shtrpd_thresholds_check_cpu_temp(struct shtrpd_ts_data *data)
+static int shtrpd_thresholds_check_cpu_temp(int force_update)
 {
+    struct shtrpd_ts_data *data = i2c_get_clientdata(shtrpd_client);
     int ret = 0;
-    long cpu_temp;
+    int cur_cpu_temp;
+    int up_snap, up_mult, up_shift, up_mult2, up_shift2, up_intouch;
+    int down_snap, down_mult, down_shift, down_mult2, down_shift2, down_intouch;
 
+    
     if(!SHTRPD_CHECK_CPU_TEMP){
-        shtrpd_snapthreshold_val = SNAPTHRESHOLD_VAL_PP2;
-        ret = shtrpd_thresholds_for_flip(data, 1);
-        if(ret < 0) {
-            SHTRPD_ERR("shtrpd_thresholds_for_flip err, ret:%d\n", ret);
+        if(force_update){
+            ret = shtrpd_user_thresholds(data, 1);
+            if(ret < 0) {
+                SHTRPD_ERR("shtrpd_user_thresholds err, ret:%d\n", ret);
+            }
         }
         return ret;
     }
+    
+    if(shtrpd_read_cpu_temp_file(SHTRPD_CPU_TEMP_FILE, &cur_cpu_temp) == 0){
+        SHTRPD_LOG_CHECK_CPU_TEMP("cpu_temp:%d\n", (int)cur_cpu_temp);
+        if(cur_cpu_temp != shtrpd_old_cpu_temp){
+            shtrpd_get_up_temp_snap_threshold(cur_cpu_temp,
+                                              &up_snap,
+                                              &up_mult,
+                                              &up_shift,
+                                              &up_mult2,
+                                              &up_shift2,
+                                              &up_intouch);
 
-    if(shtrpd_read_cpu_temp_file(SHTRPD_CPU_TEMP_FILE, &cpu_temp) != 0){
-        SHTRPD_ERR("File not found : %s\n", SHTRPD_CPU_TEMP_FILE);
-        shtrpd_snapthreshold_val = SNAPTHRESHOLD_VAL_PP2;
-        ret = shtrpd_thresholds_for_flip(data, 1);
+            shtrpd_get_down_temp_snap_threshold(cur_cpu_temp,
+                                              &down_snap,
+                                              &down_mult,
+                                              &down_shift,
+                                              &down_mult2,
+                                              &down_shift2,
+                                              &down_intouch);
+            
+	        if(shtrpd_thresholds_check_thresh_change(up_snap, up_mult, up_shift, up_mult2, up_shift2, up_intouch) != 0 &&
+	           shtrpd_thresholds_check_thresh_change(down_snap, down_mult, down_shift, down_mult2, down_shift2, down_intouch) != 0)
+	        {
+	            if(cur_cpu_temp > shtrpd_old_cpu_temp){
+					shtrpd_new_snap_threshold		= up_snap;
+					shtrpd_new_touchmultiplier_val	= up_mult;
+					shtrpd_new_touchshifter_val		= up_shift;
+					shtrpd_new_touchmultiplier2_val	= up_mult2;
+					shtrpd_new_touchshifter2_val	= up_shift2;
+					shtrpd_new_intouchmultiplier_val= up_intouch;
+				}else{
+					shtrpd_new_snap_threshold		= down_snap;
+					shtrpd_new_touchmultiplier_val	= down_mult;
+					shtrpd_new_touchshifter_val		= down_shift;
+					shtrpd_new_touchmultiplier2_val	= down_mult2;
+					shtrpd_new_touchshifter2_val	= down_shift2;
+					shtrpd_new_intouchmultiplier_val= down_intouch;
+				}
+			}
+		}
+
+        shtrpd_old_cpu_temp = cur_cpu_temp;
+    }
+    
+    if(force_update == 0 && initialSetup == true){
+        return ret;
+    }
+    
+    if(force_update || 
+        (shtrpd_snapthreshold_val    != shtrpd_new_snap_threshold) ||
+        (shtrpd_touchmultiplier_val  != shtrpd_new_touchmultiplier_val) ||
+        (shtrpd_touchshifter_val     != shtrpd_new_touchshifter_val) ||
+        (shtrpd_touchmultiplier2_val != shtrpd_new_touchmultiplier2_val) ||
+        (shtrpd_touchshifter2_val    != shtrpd_new_touchshifter2_val) ||
+        (shtrpd_intouchmultiplier_val!= shtrpd_new_intouchmultiplier_val))
+    {
+        SHTRPD_LOG_CHECK_CPU_TEMP("Change SNAPTHRESHOLD %d -> %d\n",
+                                    shtrpd_snapthreshold_val, shtrpd_new_snap_threshold);
+        SHTRPD_LOG_CHECK_CPU_TEMP("Change TOUCHMULTIPLIER_VAL %d -> %d\n",
+                                    shtrpd_touchmultiplier_val, shtrpd_new_touchmultiplier_val);
+        SHTRPD_LOG_CHECK_CPU_TEMP("Change TOUCHSHIFTER_VAL %d -> %d\n",
+                                    shtrpd_touchshifter_val, shtrpd_new_touchshifter_val);
+        SHTRPD_LOG_CHECK_CPU_TEMP("Change TOUCHMULTIPLIER2_VAL %d -> %d\n",
+                                    shtrpd_touchmultiplier2_val, shtrpd_new_touchmultiplier2_val);
+        SHTRPD_LOG_CHECK_CPU_TEMP("Change TOUCHSHIFTER2_VAL %d -> %d\n",
+                                    shtrpd_touchshifter2_val, shtrpd_new_touchshifter2_val);
+        SHTRPD_LOG_CHECK_CPU_TEMP("Change INTOUCHMULTIPLIER_VAL %d -> %d\n",
+                                    shtrpd_intouchmultiplier_val, shtrpd_new_intouchmultiplier_val);
+                                    
+        shtrpd_snapthreshold_val    = shtrpd_new_snap_threshold;
+        shtrpd_touchmultiplier_val  = shtrpd_new_touchmultiplier_val;
+        shtrpd_touchshifter_val     = shtrpd_new_touchshifter_val;
+        shtrpd_touchmultiplier2_val = shtrpd_new_touchmultiplier2_val;
+        shtrpd_touchshifter2_val    = shtrpd_new_touchshifter2_val;
+        shtrpd_intouchmultiplier_val= shtrpd_new_intouchmultiplier_val;
+
+        ret = shtrpd_user_thresholds(data, 1);
         if(ret < 0) {
-            SHTRPD_ERR("shtrpd_thresholds_for_flip err, ret:%d\n", ret);
-            return ret;
-        } else {
-            shtrpd_write_cpu_temp_high_val_flg = 0;
-            shtrpd_write_cpu_temp_low_val_flg = 1;
-        }
-    } else {
-        SHTRPD_LOG_CHECK_CPU_TEMP("cpu_temp:%d\n", (int)cpu_temp);
-
-        if(cpu_temp >= SHTRPD_CHECK_CPU_TEMP_HIGH_VAL) {
-            SHTRPD_LOG_CHECK_CPU_TEMP("Change SNAPTHRESHOLD High\n")
-            shtrpd_snapthreshold_val = SHTRPD_CHECK_CPU_TEMP_SNAP_THRESHOLD_VAL;
-            ret = shtrpd_thresholds_for_flip(data, 1);
-            if(ret < 0) {
-                SHTRPD_ERR("shtrpd_thresholds_for_flip err, ret:%d\n", ret);
-                return ret;
-            } else {
-                shtrpd_write_cpu_temp_high_val_flg = 1;
-                shtrpd_write_cpu_temp_low_val_flg = 0;
-            }
-        } else {
-            SHTRPD_LOG_CHECK_CPU_TEMP("Change SNAPTHRESHOLD Low\n")
-            shtrpd_snapthreshold_val = SNAPTHRESHOLD_VAL_PP2;
-            ret = shtrpd_thresholds_for_flip(data, 1);
-            if(ret < 0) {
-                SHTRPD_ERR("shtrpd_thresholds_for_flip err, ret:%d\n", ret);
-                return ret;
-            } else {
-                shtrpd_write_cpu_temp_high_val_flg = 0;
-                shtrpd_write_cpu_temp_low_val_flg = 1;
-            }
+            SHTRPD_ERR("shtrpd_user_thresholds err, ret:%d\n", ret);
         }
     }
-    return 0;
+    
+    return ret;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1199,10 +1357,130 @@ static void shtrpd_check_cpu_temp_func(struct work_struct *work)
 {
     mutex_lock(&shtrpd_ioctl_lock);
     if(shtrpd_flip_state) {
-        shtrpd_check_cputemp_condition();
+        shtrpd_thresholds_check_cpu_temp(0);
+        SHTRPD_LOG_CHECK_CPU_TEMP("cpu temp check timer re-start\n");
+        queue_delayed_work(shtrpd_work_queue, &shtrpd_work_cpu_temp, msecs_to_jiffies(SHTRPD_CHECK_CPU_TEMP_INTERVAL));
     }
     mutex_unlock(&shtrpd_ioctl_lock);
 }
+#if defined (CONFIG_ANDROID_ENGINEERING)
+static struct kobject   *shtrpd_snapdebug_kobj;
+
+static ssize_t shtrpd_snapdebug_uptable_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    int i;
+    char tmp[128];
+    
+    strcpy(buf, "[UP TEMP] SNAP THRESHOLD TABLE\n");
+    
+    for(i = 0;i < SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE;i++){
+        sprintf(tmp, "[%d]  <= %4d : snap = %d, mult = %d, shift = %d, mult2 = %d, shift2 = %d, intouch = %d\n",
+            i,
+            SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].temp,
+            SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].snap_threshold,
+            SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].touch_multiplier_val,
+            SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].touch_shifter_val,
+            SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].touch_multiplier2_val,
+            SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].touch_shifter2_val,
+            SHTRPD_UP_TEMP_SNAP_THRESH_TBL[i].in_touch_multiplier_val);
+        strcat(buf, tmp);
+    }
+    
+    return strlen(buf);
+}
+static ssize_t shtrpd_snapdebug_uptable_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+    int index, temp, snap, mult, shift, mult2, shift2, intouch;
+    
+    sscanf(buf, "%d %d %d %d %d %d %d %d", &index, &temp, &snap, &mult, &shift, &mult2, &shift2, &intouch );
+    
+    if(index >= SHTRPD_UP_TEMP_SNAP_THRESH_TBL_SIZE){
+        return -1;
+    }
+    
+    SHTRPD_UP_TEMP_SNAP_THRESH_TBL[index].temp = temp;
+    SHTRPD_UP_TEMP_SNAP_THRESH_TBL[index].snap_threshold = snap;
+    SHTRPD_UP_TEMP_SNAP_THRESH_TBL[index].touch_multiplier_val = mult;
+    SHTRPD_UP_TEMP_SNAP_THRESH_TBL[index].touch_shifter_val = shift;
+    SHTRPD_UP_TEMP_SNAP_THRESH_TBL[index].touch_multiplier2_val = mult2;
+    SHTRPD_UP_TEMP_SNAP_THRESH_TBL[index].touch_shifter2_val = shift2;
+    SHTRPD_UP_TEMP_SNAP_THRESH_TBL[index].in_touch_multiplier_val = intouch;
+    
+    return count;
+}
+static struct kobj_attribute shtrpd_snapdebug_uptable = 
+    __ATTR(up_table, (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP), shtrpd_snapdebug_uptable_show, shtrpd_snapdebug_uptable_store);
+
+static ssize_t shtrpd_snapdebug_downtable_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    int i;
+    char tmp[128];
+    
+    strcpy(buf, "[DOWN TEMP] SNAP THRESHOLD TABLE\n");
+    
+    for(i = 0;i < SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE;i++){
+        sprintf(tmp, "[%d]  <= %4d : snap = %d, mult = %d, shift = %d, mult2 = %d, shift2 = %d, intouch = %d\n",
+            i,
+            SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].temp,
+            SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].snap_threshold,
+            SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].touch_multiplier_val,
+            SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].touch_shifter_val,
+            SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].touch_multiplier2_val,
+            SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].touch_shifter2_val,
+            SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[i].in_touch_multiplier_val);
+        strcat(buf, tmp);
+    }
+    
+    return strlen(buf);
+}
+static ssize_t shtrpd_snapdebug_downtable_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+    int index, temp, snap, mult, shift, mult2, shift2, intouch;
+    
+    sscanf(buf, "%d %d %d %d %d %d %d %d", &index, &temp, &snap, &mult, &shift, &mult2, &shift2, &intouch );
+    
+    if(index >= SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL_SIZE){
+        return -1;
+    }
+    
+    SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[index].temp = temp;
+    SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[index].snap_threshold = snap;
+    SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[index].touch_multiplier_val = mult;
+    SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[index].touch_shifter_val = shift;
+    SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[index].touch_multiplier2_val = mult2;
+    SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[index].touch_shifter2_val = shift2;
+    SHTRPD_DOWN_TEMP_SNAP_THRESH_TBL[index].in_touch_multiplier_val = intouch;
+    
+    return count;
+}
+static struct kobj_attribute shtrpd_snapdebug_downtable = 
+    __ATTR(down_table, (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP), shtrpd_snapdebug_downtable_show, shtrpd_snapdebug_downtable_store);
+
+static struct attribute *attrs_snapdebug[] = {
+    &shtrpd_snapdebug_uptable.attr,
+    &shtrpd_snapdebug_downtable.attr,
+    NULL
+};
+
+static struct attribute_group shtrpd_attr_grp_snapdebug = {
+    .name = "snap_debug",
+    .attrs = attrs_snapdebug,
+};
+
+
+static void shtrpd_snapdebug_init(void)
+{
+    shtrpd_snapdebug_kobj = kobject_create_and_add("shtrpd", kernel_kobj);
+    
+    if(shtrpd_snapdebug_kobj == NULL){
+        SHTRPD_ERR("kobj create failed : shtrpd\n");
+    }else{
+        if(sysfs_create_group(shtrpd_snapdebug_kobj, &shtrpd_attr_grp_snapdebug)){
+            SHTRPD_ERR("kobj create failed : shtrpd_attr_grp_snapdebug\n");
+        }
+    }
+}
+#endif /* CONFIG_ANDROID_ENGINEERING */
 
 #endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
 
@@ -1925,15 +2203,17 @@ static void shtrpd_tu_delay_func(struct work_struct *work)
 			    shtrpd_filter_pos_compensation(SHTRPD_POSTYPE_X ,(1<<i));
 			    shtrpd_filter_pos_compensation(SHTRPD_POSTYPE_Y ,(1<<i));
 
-			    input_mt_slot(data->input_dev, i);
-			    input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, i+1);
-			    input_report_abs(data->input_dev, ABS_MT_POSITION_X, SHTRPD_NOTIFY_POS_SCALE_X(shtrpd_touches[i].XPos));
-			    input_report_abs(data->input_dev, ABS_MT_POSITION_Y, SHTRPD_NOTIFY_POS_SCALE_Y(shtrpd_touches[i].YPos));
-			    input_report_abs(data->input_dev, ABS_MT_PRESSURE, td_history[i].z_bk);
-			    input_sync(data->input_dev);
+                if(shtrpd_touchcruiser_state){
+  				    input_mt_slot(data->input_dev, i);
+				    input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, i+1);
+				    input_report_abs(data->input_dev, ABS_MT_POSITION_X, SHTRPD_NOTIFY_POS_SCALE_X(shtrpd_touches[i].XPos));
+				    input_report_abs(data->input_dev, ABS_MT_POSITION_Y, SHTRPD_NOTIFY_POS_SCALE_Y(shtrpd_touches[i].YPos));
+			    	input_report_abs(data->input_dev, ABS_MT_PRESSURE, td_history[i].z_bk);
+				    input_sync(data->input_dev);
 			    
-			    SHTRPD_INFO("ABS_MT_TRACKING_ID ID=%d ; STATE=1 ; X=%d ; Y=%d ; Z=%d (fail flick recover)\n" ,
-			                 i, td_history[i].x_bk, td_history[i].y_bk, td_history[i].z_bk);
+				    SHTRPD_INFO("ABS_MT_TRACKING_ID ID=%d ; STATE=1 ; X=%d ; Y=%d ; Z=%d (fail flick recover)\n" ,
+				                 i, td_history[i].x_bk, td_history[i].y_bk, td_history[i].z_bk);
+				}
 			}
 			#endif /* SHTRPD_FAIL_FLICK_RECOVER_ENABLE */
 		} else {
@@ -2151,7 +2431,7 @@ static void shtrpd_change_touch_down_threshold(struct shtrpd_ts_data *data, u8 s
 							/*  Touch Multiplier    */
 							data_buffer[1] = shtrpd_touchmultiplier_val - SHTRPD_TOUCH_DOWN_THRESHOLD_ADJUST;
 							/*  Touch Shifter   */
-							data_buffer[2] = shtrpd_properties.touchshifter_val;
+							data_buffer[2] = shtrpd_touchshifter_val;
 							/*  PM Prox Threshold   */
 							data_buffer[3] = shtrpd_properties.pmproxthreshold_val;
 							/*  Snap threshold  */
@@ -2161,9 +2441,9 @@ static void shtrpd_change_touch_down_threshold(struct shtrpd_ts_data *data, u8 s
 							/*  Non-trackpad channels prox threshold    */
 							data_buffer[6] = shtrpd_properties.proxthreshold2_val;
 							/*  Non-trackpad channels Touch Multiplier  */
-							data_buffer[7] = shtrpd_properties.touchmultiplier2_val;
+							data_buffer[7] = shtrpd_touchmultiplier2_val;
 							/*  Non-trackpad channels Touch Shifter */
-							data_buffer[8] = shtrpd_properties.touchshifter2_val;
+							data_buffer[8] = shtrpd_touchshifter2_val;
 							/*  (in-touch) Touch Threshold Multiplier */
 							data_buffer[9] = shtrpd_intouchmultiplier_val;
 							ret = shtrpd_i2c_write_block_data(data->client, THRESHOLD_SETTINGS,
@@ -2185,7 +2465,7 @@ static void shtrpd_change_touch_down_threshold(struct shtrpd_ts_data *data, u8 s
 			/*  Touch Multiplier    */
 			data_buffer[1] = shtrpd_touchmultiplier_val;
 			/*  Touch Shifter   */
-			data_buffer[2] = shtrpd_properties.touchshifter_val;
+			data_buffer[2] = shtrpd_touchshifter_val;
 			/*  PM Prox Threshold   */
 			data_buffer[3] = shtrpd_properties.pmproxthreshold_val;
 			/*  Snap threshold  */
@@ -2195,9 +2475,9 @@ static void shtrpd_change_touch_down_threshold(struct shtrpd_ts_data *data, u8 s
 			/*  Non-trackpad channels prox threshold    */
 			data_buffer[6] = shtrpd_properties.proxthreshold2_val;
 			/*  Non-trackpad channels Touch Multiplier  */
-			data_buffer[7] = shtrpd_properties.touchmultiplier2_val;
+			data_buffer[7] = shtrpd_touchmultiplier2_val;
 			/*  Non-trackpad channels Touch Shifter */
-			data_buffer[8] = shtrpd_properties.touchshifter2_val;
+			data_buffer[8] = shtrpd_touchshifter2_val;
 			/*  (in-touch) Touch Threshold Multiplier */
 			data_buffer[9] = shtrpd_intouchmultiplier_val;
 			ret = shtrpd_i2c_write_block_data(data->client, THRESHOLD_SETTINGS,
@@ -2624,6 +2904,7 @@ static void shtrpd_tu_jitter_filter_check(u8 finger_state, u16 *x, u16 *y)
 static void shtrpd_wake_lock_init(void)
 {
 	idle_sleep_ctrl_info.wake_lock_idle_state = 0;
+	wake_lock_init(&idle_sleep_ctrl_info.wake_lock, WAKE_LOCK_SUSPEND, "shtrpd_int_wake_lock");
 	pm_qos_add_request(&idle_sleep_ctrl_info.qos_cpu_latency, PM_QOS_CPU_DMA_LATENCY, PM_QOS_DEFAULT_VALUE);
 }
 
@@ -2643,6 +2924,7 @@ static void shtrpd_wake_lock_idle(void)
 	mutex_lock(&shtrpd_cpu_idle_sleep_ctrl_lock);
 	if(idle_sleep_ctrl_info.wake_lock_idle_state == 0){
 		SHTRPD_DBG("wake_lock_idle on\n");
+		wake_lock(&idle_sleep_ctrl_info.wake_lock);
 		pm_qos_update_request(&idle_sleep_ctrl_info.qos_cpu_latency, SHTRPD_QOS_LATENCY_DEF_VALUE);
 		idle_sleep_ctrl_info.wake_lock_idle_state = 1;
 	}
@@ -2657,6 +2939,7 @@ static void shtrpd_wake_unlock_idle(void)
 	mutex_lock(&shtrpd_cpu_idle_sleep_ctrl_lock);
 	if(idle_sleep_ctrl_info.wake_lock_idle_state != 0){
 		SHTRPD_DBG("wake_lock_idle off\n");
+		wake_unlock(&idle_sleep_ctrl_info.wake_lock);
 		pm_qos_update_request(&idle_sleep_ctrl_info.qos_cpu_latency, PM_QOS_DEFAULT_VALUE);
 		idle_sleep_ctrl_info.wake_lock_idle_state = 0;
 	}
@@ -2892,16 +3175,18 @@ static void shtrpd_drumming_split_notify_no_touch(struct shtrpd_ts_data *data, u
 /* ------------------------------------------------------------------------- */
 static void shtrpd_drumming_split_notify_hold_touch(struct shtrpd_ts_data *data, u8 finger)
 {
-    input_mt_slot(data->input_dev, finger);
-    input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, finger+1);
-    input_report_abs(data->input_dev, ABS_MT_POSITION_X, SHTRPD_NOTIFY_POS_SCALE_X(drumming_split[finger].hold_touch.XPos));
-    input_report_abs(data->input_dev, ABS_MT_POSITION_Y, SHTRPD_NOTIFY_POS_SCALE_Y(drumming_split[finger].hold_touch.YPos));
-    input_report_abs(data->input_dev, ABS_MT_PRESSURE, drumming_split[finger].hold_touch.touchStrength);
-    input_sync(data->input_dev);
+    if(shtrpd_touchcruiser_state){
+	    input_mt_slot(data->input_dev, finger);
+	    input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, finger+1);
+	    input_report_abs(data->input_dev, ABS_MT_POSITION_X, SHTRPD_NOTIFY_POS_SCALE_X(drumming_split[finger].hold_touch.XPos));
+	    input_report_abs(data->input_dev, ABS_MT_POSITION_Y, SHTRPD_NOTIFY_POS_SCALE_Y(drumming_split[finger].hold_touch.YPos));
+	    input_report_abs(data->input_dev, ABS_MT_PRESSURE, drumming_split[finger].hold_touch.touchStrength);
+	    input_sync(data->input_dev);
     
-    SHTRPD_INFO("ABS_MT_TRACKING_ID ID=%d ; STATE=1 ; X=%d ; Y=%d ; Z=%d (drumming split)\n" ,
+	    SHTRPD_INFO("ABS_MT_TRACKING_ID ID=%d ; STATE=1 ; X=%d ; Y=%d ; Z=%d (drumming split)\n" ,
                  finger, drumming_split[finger].hold_touch.XPos, drumming_split[finger].hold_touch.YPos,
                  drumming_split[finger].hold_touch.touchStrength);
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3237,12 +3522,14 @@ static void shtrpd_tap_jitter_filter_report_touch(void *dev_id, int id)
 {
     struct shtrpd_ts_data *data = dev_id;
 
-    input_mt_slot(data->input_dev, id);
-    input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, id+1);
-    input_report_abs(data->input_dev, ABS_MT_POSITION_X, SHTRPD_NOTIFY_POS_SCALE_X(tap_jitter[id].hold_touch.XPos));
-    input_report_abs(data->input_dev, ABS_MT_POSITION_Y, SHTRPD_NOTIFY_POS_SCALE_Y(tap_jitter[id].hold_touch.YPos));
-    input_report_abs(data->input_dev, ABS_MT_PRESSURE, tap_jitter[id].hold_touch.touchStrength);
-    input_sync(data->input_dev);
+	if(shtrpd_touchcruiser_state){
+	    input_mt_slot(data->input_dev, id);
+	    input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, id+1);
+	    input_report_abs(data->input_dev, ABS_MT_POSITION_X, SHTRPD_NOTIFY_POS_SCALE_X(tap_jitter[id].hold_touch.XPos));
+	    input_report_abs(data->input_dev, ABS_MT_POSITION_Y, SHTRPD_NOTIFY_POS_SCALE_Y(tap_jitter[id].hold_touch.YPos));
+	    input_report_abs(data->input_dev, ABS_MT_PRESSURE, tap_jitter[id].hold_touch.touchStrength);
+	    input_sync(data->input_dev);
+	}
     
     shtrpd_finger_state_old |= (1 << id);
 
@@ -3656,6 +3943,98 @@ static void shtrpd_fail_touch_clear_check(struct shtrpd_ts_data *data, u8 *finge
 	}
 }
 #endif /* SHTRPD_FAIL_TOUCH_CLEAR_ENABLE */
+
+#ifdef SHTRPD_INTOUCH_GHOST_REJECTION_ENABLE
+/* ------------------------------------------------------------------------- */
+/* shtrpd_intouch_ghost_reject_init                                          */
+/* ------------------------------------------------------------------------- */
+static void shtrpd_intouch_ghost_reject_init(void)
+{
+    memset(intouch_ghost_reject, 0, sizeof(intouch_ghost_reject));
+}
+
+/* ------------------------------------------------------------------------- */
+/* shtrpd_intouch_ghost_reject_get_z                                         */
+/* ------------------------------------------------------------------------- */
+static inline int shtrpd_intouch_ghost_reject_get_z(int ts, int area)
+{
+    ts   = (ts <= 0)? 1 : ts;
+    area = (area <= 0)? 1 : 
+           (area >= SHTRPD_INTOUCH_GHOST_REJECT_AREA_MAX)? SHTRPD_INTOUCH_GHOST_REJECT_AREA_MAX : area;
+    
+    return (ts / area);
+}
+
+/* ------------------------------------------------------------------------- */
+/* shtrpd_intouch_ghost_reject_get_z                                         */
+/* ------------------------------------------------------------------------- */
+static inline int shtrpd_intouch_ghost_reject_check_zratio(int ghost_finger, int ghost_z)
+{
+    int i, z;
+    
+    for(i = 0;i < MAX_TOUCHES;i++){
+        if(ghost_finger != i && (shtrpd_finger_fw_state & (1 << i)) != 0){
+            z = (shtrpd_touches[i].touchStrength <= 0)? 1 : shtrpd_touches[i].touchStrength;
+            SHTRPD_LOG_INTOUCH_GHOST_REJECT("[%d]/[%d] z=%d / %d, zratio=%d\n", ghost_finger, i, ghost_z, z, 
+                                               ((ghost_z * 1000) / z) / 10);
+            if(z > ghost_z){
+                if(((ghost_z * 1000) / z) < SHTRPD_INTOUCH_GHOST_REJECT_ZRATIO_THRESH * 10){
+                    return 1;
+                }
+            }
+        }
+    }
+    
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* shtrpd_intouch_ghost_reject_check                                         */
+/* ------------------------------------------------------------------------- */
+static void shtrpd_intouch_ghost_reject_check(u8 *finger_state_p)
+{
+    int i, ghost_z;
+    
+    if(!SHTRPD_INTOUCH_GHOST_REJECT_ENABLE){
+        return;
+    }
+    
+    for(i = 0;i < MAX_TOUCHES;i++){
+        if(intouch_ghost_reject[i].is_ghost == 0){
+            if((shtrpd_finger_fw_state & (1 << i)) != 0 && (shtrpd_finger_fw_state_old & (1 << i)) == 0){
+                ghost_z = shtrpd_intouch_ghost_reject_get_z(shtrpd_touches[i].touchStrength, shtrpd_touches[i].area);
+
+                if(ghost_z < SHTRPD_INTOUCH_GHOST_REJECT_Z_THRESH){
+                    if(shtrpd_intouch_ghost_reject_check_zratio(i, ghost_z) != 0){
+                        SHTRPD_LOG_INTOUCH_GHOST_REJECT("[%d] detect ghost\n", i);
+                        intouch_ghost_reject[i].is_ghost = 1;
+                        intouch_ghost_reject[i].td_x     = shtrpd_touches[i].XPos;
+                        intouch_ghost_reject[i].td_y     = shtrpd_touches[i].YPos;
+                    }
+                }
+            }
+        }else{
+            if((shtrpd_finger_fw_state & (1 << i)) == 0 ||
+               shtrpd_touches[i].touchStrength >= SHTRPD_INTOUCH_GHOST_REJECT_Z_THRESH ||
+               abs(intouch_ghost_reject[i].td_x - shtrpd_touches[i].XPos) >= SHTRPD_INTOUCH_GHOST_REJECT_MOVE_THRESH ||
+               abs(intouch_ghost_reject[i].td_y - shtrpd_touches[i].YPos) >= SHTRPD_INTOUCH_GHOST_REJECT_MOVE_THRESH ||
+               shtrpd_intouch_ghost_reject_check_zratio(i, shtrpd_intouch_ghost_reject_get_z(shtrpd_touches[i].touchStrength, shtrpd_touches[i].area)) == 0)
+            {
+                intouch_ghost_reject[i].is_ghost = 0;
+                SHTRPD_LOG_INTOUCH_GHOST_REJECT("[%d] release ghost\n", i);
+            }
+        }
+    }
+    
+    for(i = 0;i < MAX_TOUCHES;i++){
+        if(intouch_ghost_reject[i].is_ghost != 0){
+            *finger_state_p &= ~(1 << i);
+            SHTRPD_LOG_INTOUCH_GHOST_REJECT("[%d] reject ghost\n", i);
+        }
+    }
+}
+
+#endif /* SHTRPD_INTOUCH_GHOST_REJECTION_ENABLE */
 
 /* ------------------------------------------------------------------------- */
 /* shtrpd_sys_enable_irq                                                     */
@@ -4105,32 +4484,42 @@ static int shtrpd_reati(struct shtrpd_ts_data *data)
     ret = shtrpd_i2c_write_byte_data(data->client, CONTROL_SETTINGS,
         shtrpd_properties.controlsetting_val[0] | AUTO_ATI);
 #else
-    u8 data_buffer[10];
+    u8 data_buffer[11];
 
     data_buffer[0] = shtrpd_properties.controlsetting_val[0] | AUTO_ATI;
     /*  ControlSettings1    */
-    data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+    if(shtrpd_touchcruiser_state){
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+    }else{
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT;
+    }
     /*  ControlSettings2(add)    */
     if(shtrpd_atic_adj_disable)
         data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE;
     else
         data_buffer[2] = shtrpd_properties.controlsetting_val[2];
     
+    if(shtrpd_temp_drift)
+        data_buffer[2] |= TEMP_DRIFT_MODE;
+    
+    /*  ControlSettings3(add)    */
+    data_buffer[3] = shtrpd_properties.controlsetting_val[3];
+    
     /*  ATI Settings Data   */
-    data_buffer[3] = (unsigned char)(shtrpd_properties.atitarget_val>>8);
+    data_buffer[4] = (unsigned char)(shtrpd_properties.atitarget_val>>8);
     /*  ATI Target  */
-    data_buffer[4] = (unsigned char)shtrpd_properties.atitarget_val;
+    data_buffer[5] = (unsigned char)shtrpd_properties.atitarget_val;
     /*  ATI C   */
-    data_buffer[5] = shtrpd_properties.atic_val;
-    data_buffer[6] = (unsigned char)(shtrpd_properties.atitarget2_val>>8);
+    data_buffer[6] = shtrpd_properties.atic_val;
+    data_buffer[7] = (unsigned char)(shtrpd_properties.atitarget2_val>>8);
     /*  Non-trackpad channels ATI Target    */
-    data_buffer[7] = (unsigned char)shtrpd_properties.atitarget2_val;
+    data_buffer[8] = (unsigned char)shtrpd_properties.atitarget2_val;
     /*  Non-trackpad channels ATI C */
-    data_buffer[8] = shtrpd_properties.atic2_val;
-    data_buffer[9] = shtrpd_properties.re_ati_range;
+    data_buffer[9] = shtrpd_properties.atic2_val;
+    data_buffer[10] = shtrpd_properties.re_ati_range;
 
     ret = shtrpd_i2c_write_block_data(data->client, CONTROL_SETTINGS,
-        10, data_buffer);
+        11, data_buffer);
 
 #endif
     return ret;
@@ -4144,33 +4533,43 @@ static int shtrpd_reati_atisetting_data_clear(struct shtrpd_ts_data *data)
 {
     int ret;
     int i = 0;
-    u8 data_buffer[19];
+    u8 data_buffer[20];
 
     data_buffer[0] = shtrpd_properties.controlsetting_val[0] | AUTO_ATI;
     /*  ControlSettings1    */
-    data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+    if(shtrpd_touchcruiser_state){
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+    }else{
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT;
+    }
     /*  ControlSettings2(add)    */
     data_buffer[2] = shtrpd_properties.controlsetting_val[2];
+
+    if(shtrpd_temp_drift)
+        data_buffer[2] |= TEMP_DRIFT_MODE;
+    
+    /*  ControlSettings3(add)    */
+    data_buffer[3] = shtrpd_properties.controlsetting_val[3];
     
     /*  ATI Settings Data   */
-    data_buffer[3] = (unsigned char)(shtrpd_properties.atitarget_val>>8);
+    data_buffer[4] = (unsigned char)(shtrpd_properties.atitarget_val>>8);
     /*  ATI Target  */
-    data_buffer[4] = (unsigned char)shtrpd_properties.atitarget_val;
+    data_buffer[5] = (unsigned char)shtrpd_properties.atitarget_val;
     /*  ATI C   */
-    data_buffer[5] = shtrpd_properties.atic_val;
-    data_buffer[6] = (unsigned char)(shtrpd_properties.atitarget2_val>>8);
+    data_buffer[6] = shtrpd_properties.atic_val;
+    data_buffer[7] = (unsigned char)(shtrpd_properties.atitarget2_val>>8);
     /*  Non-trackpad channels ATI Target    */
-    data_buffer[7] = (unsigned char)shtrpd_properties.atitarget2_val;
+    data_buffer[8] = (unsigned char)shtrpd_properties.atitarget2_val;
     /*  Non-trackpad channels ATI C */
-    data_buffer[8] = shtrpd_properties.atic2_val;
-    data_buffer[9] = shtrpd_properties.re_ati_range;
+    data_buffer[9] = shtrpd_properties.atic2_val;
+    data_buffer[10] = shtrpd_properties.re_ati_range;
     /*  ATI C Adjust[Rx0]-[Rx8] */
-    for( i = 10; i < 19; i++){
+    for( i = 11; i < 20; i++){
         data_buffer[i] = 0;
     }
 
     ret = shtrpd_i2c_write_block_data(data->client, CONTROL_SETTINGS,
-        19, data_buffer);
+        20, data_buffer);
     return ret;
 }
 
@@ -4180,7 +4579,7 @@ static int shtrpd_reati_atisetting_data_clear(struct shtrpd_ts_data *data)
 /*  Send control settings to the Trackpad Device - Power modes, etc */
 static int shtrpd_control_settings(struct shtrpd_ts_data *data)
 {
-    u8 data_buffer[3];
+    u8 data_buffer[4];
     int ret;
 
 #if 0
@@ -4194,17 +4593,27 @@ static int shtrpd_control_settings(struct shtrpd_ts_data *data)
     /*  ControlSettings0 and clear ACK_RESET Bit    */
     data_buffer[0] = shtrpd_properties.controlsetting_val[0] | SHOW_RESET;
     /*  ControlSettings1    */
-    data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+    if(shtrpd_touchcruiser_state){
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+    }else{
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT;
+    }
     /*  ControlSettings2(add)    */
     if(shtrpd_atic_adj_disable)
         data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE;
     else
         data_buffer[2] = shtrpd_properties.controlsetting_val[2];
 
+    if(shtrpd_temp_drift)
+        data_buffer[2] |= TEMP_DRIFT_MODE;
+    
+    /*  ControlSettings3(add)    */
+    data_buffer[3] = shtrpd_properties.controlsetting_val[3];
+
 #endif
     /*  Write the 2 control settings bytes  */
     ret = shtrpd_i2c_write_block_data(data->client, CONTROL_SETTINGS,
-        3, data_buffer);
+        4, data_buffer);
     return ret;
 }
 
@@ -4214,7 +4623,7 @@ static int shtrpd_control_settings(struct shtrpd_ts_data *data)
 /*  Set the Trackpad Device to Event Mode or Streaming mode */
 static int shtrpd_switch_event_mode(struct shtrpd_ts_data *data, bool event)
 {
-    u8 data_buffer[3];
+    u8 data_buffer[4];
     int ret;
 
 #if 0
@@ -4236,13 +4645,22 @@ static int shtrpd_switch_event_mode(struct shtrpd_ts_data *data, bool event)
         /*  ControlSettings0 */
         data_buffer[0] = shtrpd_properties.controlsetting_val[0] | EVENT_MODE | AUTO_MODES;
         /*  ControlSettings1    */
-        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | LOW_POWER;
+        if(shtrpd_touchcruiser_state){
+            data_buffer[1] = shtrpd_properties.controlsetting_val[1] | LOW_POWER;
+        }else{
+            data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT | LOW_POWER;
+        }
         /*  ControlSettings2(add)    */
         if(shtrpd_atic_adj_disable)
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE | PM_RE_ATI | NM_RE_ATI;
         else
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | PM_RE_ATI | NM_RE_ATI;
 
+        if(shtrpd_temp_drift)
+            data_buffer[2] |= TEMP_DRIFT_MODE;
+        
+        /*  ControlSettings3(add)    */
+        data_buffer[3] = shtrpd_properties.controlsetting_val[3];
 
     /*  If we need to go to streaming data,
      *  just send register data
@@ -4251,17 +4669,27 @@ static int shtrpd_switch_event_mode(struct shtrpd_ts_data *data, bool event)
         /*  ControlSettings0 */
         data_buffer[0] = shtrpd_properties.controlsetting_val[0] | AUTO_MODES;
         /*  ControlSettings1    */
-        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | LOW_POWER;
+        if(shtrpd_touchcruiser_state){
+            data_buffer[1] = shtrpd_properties.controlsetting_val[1] | LOW_POWER;
+        }else{
+            data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT | LOW_POWER;
+        }
         /*  ControlSettings2(add)    */
         if(shtrpd_atic_adj_disable)
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE | PM_RE_ATI | NM_RE_ATI;
         else
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | PM_RE_ATI | NM_RE_ATI;
+
+        if(shtrpd_temp_drift)
+            data_buffer[2] |= TEMP_DRIFT_MODE;
+        
+        /*  ControlSettings3(add)    */
+        data_buffer[3] = shtrpd_properties.controlsetting_val[3];
     }
 #endif
     /*  Switch Event/Streaming Mode */
     ret = shtrpd_i2c_write_block_data(data->client, CONTROL_SETTINGS,
-        3, data_buffer);
+        4, data_buffer);
     return ret;
 }
 
@@ -4346,7 +4774,7 @@ static int shtrpd_thresholds(struct shtrpd_ts_data *data)
     /*  Touch Multiplier    */
     data_buffer[1] = shtrpd_touchmultiplier_val;
     /*  Touch Shifter   */
-    data_buffer[2] = shtrpd_properties.touchshifter_val;
+    data_buffer[2] = shtrpd_touchshifter_val;
     /*  PM Prox Threshold   */
     data_buffer[3] = shtrpd_properties.pmproxthreshold_val;
     /*  Snap threshold  */
@@ -4356,9 +4784,9 @@ static int shtrpd_thresholds(struct shtrpd_ts_data *data)
     /*  Non-trackpad channels prox threshold    */
     data_buffer[6] = shtrpd_properties.proxthreshold2_val;
     /*  Non-trackpad channels Touch Multiplier  */
-    data_buffer[7] = shtrpd_properties.touchmultiplier2_val;
+    data_buffer[7] = shtrpd_touchmultiplier2_val;
     /*  Non-trackpad channels Touch Shifter */
-    data_buffer[8] = shtrpd_properties.touchshifter2_val;
+    data_buffer[8] = shtrpd_touchshifter2_val;
     /*  (in-touch) Touch Threshold Multiplier */
 	data_buffer[9] = shtrpd_intouchmultiplier_val;
 #endif
@@ -4653,6 +5081,34 @@ static int shtrpd_change_normal_mode(struct shtrpd_ts_data *data)
 }
 
 /* ------------------------------------------------------------------------- */
+/* shtrpd_reati_temp_drift_settings                                          */
+/* ------------------------------------------------------------------------- */
+static int shtrpd_reati_temp_drift_settings(struct shtrpd_ts_data *data)
+{
+    u8 data_buffer[3];
+    int ret;
+
+    if(shtrpd_properties.temp_non_detect_avg   == 0 &&
+       shtrpd_properties.temp_min_delta        == 0 &&
+       shtrpd_properties.temp_lta_adj_interval == 0)
+    {
+        return 0;
+    }
+    
+    /*  Number of channels showing drift that triggers Re-ATI counter */
+    data_buffer[0] = shtrpd_properties.temp_non_detect_avg;
+    /*  Length of time before Re-ATI */
+    data_buffer[1] = shtrpd_properties.temp_min_delta;
+    /*  Delta of variation allowed */
+    data_buffer[2] = shtrpd_properties.temp_lta_adj_interval;
+
+    /* Set Parameters for Re-ATI from temperature drift */
+    ret = shtrpd_i2c_write_block_data(data->client, REATI_TEMP_DRIFT,
+        3, data_buffer);
+    return ret;
+}
+
+/* ------------------------------------------------------------------------- */
 /* shtrpd_initialSetup                                                       */
 /* ------------------------------------------------------------------------- */
 static void shtrpd_properties_init(void)
@@ -4662,6 +5118,7 @@ static void shtrpd_properties_init(void)
     shtrpd_properties.controlsetting_val[0] = CONTROLSETTINGS0_VAL;
     shtrpd_properties.controlsetting_val[1] = CONTROLSETTINGS1_VAL;
     shtrpd_properties.controlsetting_val[2] = CONTROLSETTINGS2_VAL;
+    shtrpd_properties.controlsetting_val[3] = CONTROLSETTINGS3_VAL;
 
     shtrpd_properties.proxthreshold_val    = PROXTHRESHOLD_VAL;
     shtrpd_properties.touchmultiplier_val  = TOUCHMULTIPLIER_VAL;
@@ -4727,6 +5184,10 @@ static void shtrpd_properties_init(void)
     shtrpd_properties.pmatitarget_val = PMATITARGET_VAL;
     shtrpd_properties.pmatic_val      = PMATIC_VAL;
     shtrpd_properties.pm_re_ati_range = PM_RE_ATI_RANGE;
+
+    shtrpd_properties.temp_non_detect_avg   = TEMP_NON_DETECT_AVG;
+    shtrpd_properties.temp_min_delta        = TEMP_MIN_DELTA;
+    shtrpd_properties.temp_lta_adj_interval = TEMP_LTA_ADJ_INTERVAL;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -4764,7 +5225,12 @@ static void shtrpd_initialSetup( void *dev_id )
     /*  Setup Thresholds    */
     case 2:
 #if defined( SHTRPD_CHECK_CPU_TEMP_ENABLE )
-        ret = shtrpd_thresholds_check_cpu_temp(data);
+        if(SHTRPD_CHECK_CPU_TEMP){
+	        SHTRPD_LOG_CHECK_CPU_TEMP("cpu temp check timer start\n");
+            cancel_delayed_work(&shtrpd_work_cpu_temp);
+            queue_delayed_work(shtrpd_work_queue, &shtrpd_work_cpu_temp, msecs_to_jiffies(SHTRPD_CHECK_CPU_TEMP_INTERVAL));
+        }
+        ret = shtrpd_thresholds_check_cpu_temp(1);
         if(ret >= 0){
             setupCounter++;
         }else{
@@ -4901,6 +5367,11 @@ static void shtrpd_initialSetup( void *dev_id )
 
             usleep(SHTRPD_INITIAL_DOWN_DELAY);
 
+            ret = shtrpd_reati_temp_drift_settings(data);
+            if(ret < 0){
+                goto fail;
+            }
+
             /*  Setup is now done   */
             setupCounter = 0;
             initialSetup = false;
@@ -4945,35 +5416,45 @@ fail:
 static long shtrpd_int_timing_check_reati(void)
 {
     int32_t ret = -1;
-    u8 data_buffer[10];
+    u8 data_buffer[11];
 
     SHTRPD_DBG("refresh re-ati start  \n");
 
     /*  ControlSettings0 and clear ACK_RESET Bit    */
     data_buffer[0] = shtrpd_properties.controlsetting_val[0] | AUTO_ATI | EVENT_MODE | AUTO_MODES;
     /*  ControlSettings1    */
-    data_buffer[1] = shtrpd_properties.controlsetting_val[1] | LOW_POWER;
+    if(shtrpd_touchcruiser_state){
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | LOW_POWER;
+    }else{
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT | LOW_POWER;
+    }
     /*  ControlSettings2(add)    */
     if(shtrpd_atic_adj_disable)
         data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE | PM_RE_ATI | NM_RE_ATI;
     else
         data_buffer[2] = shtrpd_properties.controlsetting_val[2] | PM_RE_ATI | NM_RE_ATI;
 
+    if(shtrpd_temp_drift)
+        data_buffer[2] |= TEMP_DRIFT_MODE;
+    
+    /*  ControlSettings3(add)    */
+    data_buffer[3] = shtrpd_properties.controlsetting_val[3];
+
     /*  ATI Settings Data   */
-    data_buffer[3] = (unsigned char)(shtrpd_properties.atitarget_val>>8);
+    data_buffer[4] = (unsigned char)(shtrpd_properties.atitarget_val>>8);
     /*  ATI Target  */
-    data_buffer[4] = (unsigned char)shtrpd_properties.atitarget_val;
+    data_buffer[5] = (unsigned char)shtrpd_properties.atitarget_val;
     /*  ATI C   */
-    data_buffer[5] = shtrpd_properties.atic_val;
-    data_buffer[6] = (unsigned char)(shtrpd_properties.atitarget2_val>>8);
+    data_buffer[6] = shtrpd_properties.atic_val;
+    data_buffer[7] = (unsigned char)(shtrpd_properties.atitarget2_val>>8);
     /*  Non-trackpad channels ATI Target    */
-    data_buffer[7] = (unsigned char)shtrpd_properties.atitarget2_val;
+    data_buffer[8] = (unsigned char)shtrpd_properties.atitarget2_val;
     /*  Non-trackpad channels ATI C */
-    data_buffer[8] = shtrpd_properties.atic2_val;
-    data_buffer[9] = shtrpd_properties.re_ati_range;
+    data_buffer[9] = shtrpd_properties.atic2_val;
+    data_buffer[10] = shtrpd_properties.re_ati_range;
     
     ret = shtrpd_i2c_user_write_block_data(shtrpd_client, CONTROL_SETTINGS, 
-                                       10, data_buffer);
+                                       11, data_buffer);
 
     SHTRPD_DBG("refresh re-ati end\n");
 
@@ -5355,6 +5836,10 @@ static void shtrpd_multiple_touches(void *dev_id, u8 *buffer, u8 noOfTouches)
     shtrpd_filter_topofscreen_ghost_reject_check(&finger_state);
 #endif /* SHTRPD_TOP_OF_SCREEN_GHOST_REJECTION_ENABLE */
 
+#ifdef SHTRPD_INTOUCH_GHOST_REJECTION_ENABLE
+    shtrpd_intouch_ghost_reject_check(&finger_state);
+#endif /* SHTRPD_INTOUCH_GHOST_REJECTION_ENALBE */
+
 #if defined(SHTRPD_TOUCH_DOWN_THRESHOLD_ENABLE)
     shtrpd_change_touch_down_threshold(data, finger_state, wk_Xpos, wk_Ypos);
 #endif /* SHTRPD_TOUCH_DOWN_THRESHOLD_ENABLE */
@@ -5412,16 +5897,18 @@ static void shtrpd_multiple_touches(void *dev_id, u8 *buffer, u8 noOfTouches)
                      shtrpd_touches[i].touchStrength);
 
         if((finger_state & (1<<i))){ 
-            SHTRPD_DBG("input_report: ID=%d\n", i);
-            input_mt_slot(data->input_dev, i);
-            input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, i+1);
-            input_report_abs(data->input_dev, ABS_MT_POSITION_X, SHTRPD_NOTIFY_POS_SCALE_X(shtrpd_touches[i].XPos));
-            input_report_abs(data->input_dev, ABS_MT_POSITION_Y, SHTRPD_NOTIFY_POS_SCALE_Y(shtrpd_touches[i].YPos));
-            if (shtrpd_touches[i].touchStrength == 0) {
-                shtrpd_touches[i].touchStrength = 1;
+            if(shtrpd_touchcruiser_state){
+                SHTRPD_DBG("input_report: ID=%d\n", i);
+                input_mt_slot(data->input_dev, i);
+                input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, i+1);
+                input_report_abs(data->input_dev, ABS_MT_POSITION_X, SHTRPD_NOTIFY_POS_SCALE_X(shtrpd_touches[i].XPos));
+                input_report_abs(data->input_dev, ABS_MT_POSITION_Y, SHTRPD_NOTIFY_POS_SCALE_Y(shtrpd_touches[i].YPos));
+                if (shtrpd_touches[i].touchStrength == 0) {
+                    shtrpd_touches[i].touchStrength = 1;
+                }
+                input_report_abs(data->input_dev, ABS_MT_PRESSURE, shtrpd_touches[i].touchStrength);
+                input_sync(data->input_dev);
             }
-            input_report_abs(data->input_dev, ABS_MT_PRESSURE, shtrpd_touches[i].touchStrength);
-            input_sync(data->input_dev);
         } else {
             if((shtrpd_finger_state_old & (1<<i))){
                 SHTRPD_DBG("input_report -1: ID=%d\n", i);
@@ -5847,6 +6334,9 @@ static void shtrpd_touch_force_off(void)
 #if defined(SHTRPD_TOP_OF_SCREEN_GHOST_REJECTION_ENABLE)
     shtrpd_filter_topofscreen_ghost_reject_init();
 #endif /* SHTRPD_TOP_OF_SCREEN_GHOST_REJECTION_ENABLE */
+#ifdef SHTRPD_INTOUCH_GHOST_REJECTION_ENABLE
+    shtrpd_intouch_ghost_reject_init();
+#endif /* SHTRPD_INTOUCH_GHOST_REJECTION_ENABLE */
 #if defined(SHTRPD_TU_JITTER_FILTER_ENABLE)
     shtrpd_tu_jitter_filter_init();
 #endif /* SHTRPD_TU_JITTER_FILTER_ENABLE */
@@ -6583,7 +7073,12 @@ static void shtrpd_pwkey_delay_func(struct work_struct *work)
 #if defined( SHTRPD_CHECK_CPU_TEMP_ENABLE )
     mutex_lock(&shtrpd_ioctl_lock);
     if(shtrpd_flip_state) {
-        shtrpd_check_cputemp_condition();
+        if(SHTRPD_CHECK_CPU_TEMP){
+	        SHTRPD_LOG_CHECK_CPU_TEMP("cpu temp check timer start\n");
+            cancel_delayed_work(&shtrpd_work_cpu_temp);
+            queue_delayed_work(shtrpd_work_queue, &shtrpd_work_cpu_temp, msecs_to_jiffies(SHTRPD_CHECK_CPU_TEMP_INTERVAL));
+            shtrpd_thresholds_check_cpu_temp(0);
+        }
     }
     mutex_unlock(&shtrpd_ioctl_lock);
 #endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
@@ -6682,6 +7177,7 @@ static irqreturn_t shtrpd_ts_interrupt(int irq, void *dev_id)
     u8 noOfTouches = 0;
     u8 snap_output = 0;
     u8 ret = 0;
+    int i;
 
     if(!shtrpd_flip_state){
         goto out;
@@ -6806,6 +7302,17 @@ static irqreturn_t shtrpd_ts_interrupt(int irq, void *dev_id)
     if(0 != shtrpd_touchevent_sw){
         /*  multiple touches */
         shtrpd_multiple_touches(dev_id, buffer, noOfTouches);
+    }
+
+    if(!shtrpd_touchcruiser_state){
+        for(i=0; i<MAX_TOUCHES; i++){
+            if( shtrpd_finger_state_old & (1<<i)){
+                input_mt_slot(data->input_dev, i);
+                input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, -1);
+                input_sync(data->input_dev);
+                SHTRPD_DBG("ABS_MT_SLOT slot=%d\n",i);
+            }
+        }
     }
 
     /*  Report Snap output bit */
@@ -7947,17 +8454,19 @@ static long shtrpd_ioctl_property(struct file *filp, unsigned int cmd,
             property.param[0] = (int)shtrpd_properties.controlsetting_val[0];
             property.param[1] = (int)shtrpd_properties.controlsetting_val[1];
             property.param[2] = (int)shtrpd_properties.controlsetting_val[2];
-            SHTRPD_DBG("property read CONTROLSETTINGS, %d, %d, %d \n",
+            property.param[3] = (int)shtrpd_properties.controlsetting_val[3];
+            SHTRPD_DBG("property read CONTROLSETTINGS, %d, %d, %d, %d \n",
                                       property.param[0],property.param[1],
-                                      property.param[2]);
+                                      property.param[2],property.param[3]);
 
         }else if(SHTRPD_PROPERTY_CMD_WRITE == property.cmd){
             shtrpd_properties.controlsetting_val[0] = (u8)property.param[0];
             shtrpd_properties.controlsetting_val[1] = (u8)property.param[1];
             shtrpd_properties.controlsetting_val[2] = (u8)property.param[2];
-            SHTRPD_DBG("property write CONTROLSETTINGS, %d, %d, %d \n",
+            shtrpd_properties.controlsetting_val[3] = (u8)property.param[3];
+            SHTRPD_DBG("property write CONTROLSETTINGS, %d, %d, %d, %d \n",
                                       property.param[0],property.param[1],
-                                      property.param[2]);
+                                      property.param[2],property.param[3]);
 
         }else{
             SHTRPD_ERR("property access error, id=%d cmd=%d param=%d\n",
@@ -7970,12 +8479,12 @@ static long shtrpd_ioctl_property(struct file *filp, unsigned int cmd,
         if(SHTRPD_PROPERTY_CMD_READ == property.cmd){
             property.param[0] = (int)shtrpd_properties.proxthreshold_val;
             property.param[1] = shtrpd_touchmultiplier_val;
-            property.param[2] = (int)shtrpd_properties.touchshifter_val;
+            property.param[2] = shtrpd_touchshifter_val;
             property.param[3] = (int)shtrpd_properties.pmproxthreshold_val;
             property.param[4] = shtrpd_snapthreshold_val;
             property.param[5] = (int)shtrpd_properties.proxthreshold2_val;
-            property.param[6] = (int)shtrpd_properties.touchmultiplier2_val;
-            property.param[7] = (int)shtrpd_properties.touchshifter2_val;
+            property.param[6] = shtrpd_touchmultiplier2_val;
+            property.param[7] = shtrpd_touchshifter2_val;
             property.param[8] = shtrpd_intouchmultiplier_val;
             SHTRPD_DBG("property read THRESHOLD, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
                                       property.param[0],property.param[1],
@@ -7987,12 +8496,12 @@ static long shtrpd_ioctl_property(struct file *filp, unsigned int cmd,
         }else if(SHTRPD_PROPERTY_CMD_WRITE == property.cmd){
             shtrpd_properties.proxthreshold_val     = (u8) property.param[0];
             shtrpd_touchmultiplier_val              = (u8) property.param[1];
-            shtrpd_properties.touchshifter_val      = (u8) property.param[2];
+            shtrpd_touchshifter_val                 = (u8) property.param[2];
             shtrpd_properties.pmproxthreshold_val   = (u8) property.param[3];
             shtrpd_snapthreshold_val                = (u16)property.param[4];
             shtrpd_properties.proxthreshold2_val    = (u8) property.param[5];
-            shtrpd_properties.touchmultiplier2_val  = (u8) property.param[6];
-            shtrpd_properties.touchshifter2_val     = (u8) property.param[7];
+            shtrpd_touchmultiplier2_val             = (u8) property.param[6];
+            shtrpd_touchshifter2_val                = (u8) property.param[7];
             shtrpd_intouchmultiplier_val            = (u8) property.param[8];
             SHTRPD_DBG("property write THRESHOLD, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
                                       property.param[0],property.param[1],
@@ -8195,6 +8704,30 @@ static long shtrpd_ioctl_property(struct file *filp, unsigned int cmd,
         }
         break;
 
+    case SHTRPD_PROPERTY_TEMPDRIFT:
+        if(SHTRPD_PROPERTY_CMD_READ == property.cmd){
+            property.param[0] = (int)shtrpd_properties.temp_non_detect_avg;
+            property.param[1] = (int)shtrpd_properties.temp_min_delta;
+            property.param[2] = (int)shtrpd_properties.temp_lta_adj_interval;
+            SHTRPD_DBG("property read TEMP_DRIFT, %d, %d, %d \n",
+                                      property.param[0],property.param[1],
+                                      property.param[2]);
+
+        }else if(SHTRPD_PROPERTY_CMD_WRITE == property.cmd){
+            shtrpd_properties.temp_non_detect_avg   = (u8)property.param[0];
+            shtrpd_properties.temp_min_delta        = (u8)property.param[1];
+            shtrpd_properties.temp_lta_adj_interval = (u8)property.param[2];
+            SHTRPD_DBG("property write TEMP_DRIFT, %d, %d, %d \n",
+                                      property.param[0],property.param[1],
+                                      property.param[2]);
+
+        }else{
+            SHTRPD_ERR("property access error, id=%d cmd=%d param=%d\n",
+                                 property.id, property.cmd, property.param[0]);
+            return -EFAULT;
+        }
+        break;
+
     default:
         SHTRPD_ERR("property id nothing, id=%d\n", property.id);
         return -EFAULT;
@@ -8261,35 +8794,45 @@ static long shtrpd_ioctl_set_reati(struct file *filp, unsigned int cmd,
                                                            unsigned long arg)
 {
     int32_t ret = -1;
-    u8 data_buffer[10];
+    u8 data_buffer[11];
 
     SHTRPD_DBG("SHTRPDIO_SET_REATI \n");
 
     /*  ControlSettings0 and clear ACK_RESET Bit    */
     data_buffer[0] = shtrpd_properties.controlsetting_val[0] | AUTO_ATI;
     /*  ControlSettings1    */
-    data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+    if(shtrpd_touchcruiser_state){
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+    }else{
+        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT;
+    }
     /*  ControlSettings2(add)    */
     if(shtrpd_atic_adj_disable)
         data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE;
     else
         data_buffer[2] = shtrpd_properties.controlsetting_val[2];
 
+    if(shtrpd_temp_drift)
+        data_buffer[2] |= TEMP_DRIFT_MODE;
+    
+    /*  ControlSettings3(add)    */
+    data_buffer[3] = shtrpd_properties.controlsetting_val[3];
+
     /*  ATI Settings Data   */
-    data_buffer[3] = (unsigned char)(shtrpd_properties.atitarget_val>>8);
+    data_buffer[4] = (unsigned char)(shtrpd_properties.atitarget_val>>8);
     /*  ATI Target  */
-    data_buffer[4] = (unsigned char)shtrpd_properties.atitarget_val;
+    data_buffer[5] = (unsigned char)shtrpd_properties.atitarget_val;
     /*  ATI C   */
-    data_buffer[5] = shtrpd_properties.atic_val;
-    data_buffer[6] = (unsigned char)(shtrpd_properties.atitarget2_val>>8);
+    data_buffer[6] = shtrpd_properties.atic_val;
+    data_buffer[7] = (unsigned char)(shtrpd_properties.atitarget2_val>>8);
     /*  Non-trackpad channels ATI Target    */
-    data_buffer[7] = (unsigned char)shtrpd_properties.atitarget2_val;
+    data_buffer[8] = (unsigned char)shtrpd_properties.atitarget2_val;
     /*  Non-trackpad channels ATI C */
-    data_buffer[8] = shtrpd_properties.atic2_val;
-    data_buffer[9] = shtrpd_properties.re_ati_range;
+    data_buffer[9] = shtrpd_properties.atic2_val;
+    data_buffer[10] = shtrpd_properties.re_ati_range;
     
     ret = shtrpd_i2c_user_write_block_data(shtrpd_client, CONTROL_SETTINGS, 
-                                       10, data_buffer);
+                                       11, data_buffer);
 
     SHTRPD_DBG("SHTRPDIO_SET_REATI END\n");
 
@@ -8307,6 +8850,39 @@ static long shtrpd_ioctl_set_keymode(struct file *filp, unsigned int cmd,
     shtrpd_snap_set_keymode((int)arg);
     
     SHTRPD_DBG("SHTRPDIO_SET_KEYMODE END\n");
+    
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* shtrpd_ioctl_set_touchcruiser                                             */
+/* ------------------------------------------------------------------------- */
+static long shtrpd_ioctl_set_touchcruiser(struct file *filp, unsigned int cmd, 
+                                                           unsigned long arg)
+{
+    int i = 0;
+    
+    struct shtrpd_ts_data *data = i2c_get_clientdata(shtrpd_client);
+    
+    SHTRPD_DBG("SHTRPDIO_SET_TOUCHCRUISER(%d) \n", (int)arg);
+    
+    shtrpd_touchcruiser_state = (int)arg;
+    
+    if(shtrpd_flip_state) {
+        shtrpd_user_switch_event_mode(data, true);
+        if(!shtrpd_touchcruiser_state) {
+            for(i=0; i<MAX_TOUCHES; i++){
+                if( shtrpd_finger_state_old & (1<<i)){
+                    input_mt_slot(data->input_dev, i);
+                    input_report_abs(data->input_dev, ABS_MT_TRACKING_ID, -1);
+                    input_sync(data->input_dev);
+                    SHTRPD_DBG("ABS_MT_SLOT slot=%d\n",i);
+                }
+            }
+        }
+    }
+    
+    SHTRPD_DBG("SHTRPDIO_SET_TOUCHCRUISER END\n");
     
     return 0;
 }
@@ -8379,7 +8955,11 @@ static long shtrpd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     case SHTRPDIO_SET_KEYMODE:
         rc = shtrpd_ioctl_set_keymode(filp, cmd, arg);
         break;
-        
+
+    case SHTRPDIO_SET_TOUCHCRUISER:
+        rc = shtrpd_ioctl_set_touchcruiser(filp, cmd, arg);
+        break;
+
     default:
         mutex_unlock(&shtrpd_ioctl_lock);
         return -ENOTTY;
@@ -8406,7 +8986,7 @@ static struct miscdevice shtrpd_device = {
 };
 
 /* ------------------------------------------------------------------------- */
-/* shtrpd_timing_settings_for_flip                                           */
+/* shtrpd_user_timing_settings                                               */
 /* ------------------------------------------------------------------------- */
 /**
  *  Setup the Timing settings for each channel
@@ -8414,7 +8994,7 @@ static struct miscdevice shtrpd_device = {
  *  is detected.
  *  At the moment a LP time of 160ms is implemented
  */
-static int shtrpd_timing_settings_for_flip(struct shtrpd_ts_data *data, u8 enable)
+static int shtrpd_user_timing_settings(struct shtrpd_ts_data *data, u8 enable)
 {
     u8 data_buffer[6];
     int ret;
@@ -8452,10 +9032,10 @@ static int shtrpd_timing_settings_for_flip(struct shtrpd_ts_data *data, u8 enabl
 }
 
 /* ------------------------------------------------------------------------- */
-/* shtrpd_thresholds_for_flip                                                */
+/* shtrpd_user_thresholds                                                    */
 /* ------------------------------------------------------------------------- */
 /*  Setup the touch Thresholds for each channel */
-static int shtrpd_thresholds_for_flip(struct shtrpd_ts_data *data, u8 enable)
+static int shtrpd_user_thresholds(struct shtrpd_ts_data *data, u8 enable)
 {
     u8 data_buffer[10];
     int ret;
@@ -8466,7 +9046,7 @@ static int shtrpd_thresholds_for_flip(struct shtrpd_ts_data *data, u8 enable)
         /*  Touch Multiplier    */
         data_buffer[1] = shtrpd_touchmultiplier_val;
         /*  Touch Shifter   */
-        data_buffer[2] = shtrpd_properties.touchshifter_val;
+        data_buffer[2] = shtrpd_touchshifter_val;
         /*  PM Prox Threshold   */
         data_buffer[3] = shtrpd_properties.pmproxthreshold_val;
         /*  Snap threshold  */
@@ -8476,9 +9056,9 @@ static int shtrpd_thresholds_for_flip(struct shtrpd_ts_data *data, u8 enable)
         /*  Non-trackpad channels prox threshold    */
         data_buffer[6] = shtrpd_properties.proxthreshold2_val;
         /*  Non-trackpad channels Touch Multiplier  */
-        data_buffer[7] = shtrpd_properties.touchmultiplier2_val;
+        data_buffer[7] = shtrpd_touchmultiplier2_val;
         /*  Non-trackpad channels Touch Shifter */
-        data_buffer[8] = shtrpd_properties.touchshifter2_val;
+        data_buffer[8] = shtrpd_touchshifter2_val;
         /*  (in-touch) Touch Threshold Multiplier */
         data_buffer[9] = shtrpd_intouchmultiplier_val;
     } else {
@@ -8487,7 +9067,7 @@ static int shtrpd_thresholds_for_flip(struct shtrpd_ts_data *data, u8 enable)
         /*  Touch Multiplier    */
         data_buffer[1] = shtrpd_touchmultiplier_flipclose_val;
         /*  Touch Shifter   */
-        data_buffer[2] = shtrpd_properties.touchshifter_val;
+        data_buffer[2] = shtrpd_touchshifter_val;
         /*  PM Prox Threshold   */
         data_buffer[3] = shtrpd_pmproxthreshold_flipclose_val;
         /*  Snap threshold  */
@@ -8497,9 +9077,9 @@ static int shtrpd_thresholds_for_flip(struct shtrpd_ts_data *data, u8 enable)
         /*  Non-trackpad channels prox threshold    */
         data_buffer[6] = shtrpd_properties.proxthreshold2_val;
         /*  Non-trackpad channels Touch Multiplier  */
-        data_buffer[7] = shtrpd_properties.touchmultiplier2_val;
+        data_buffer[7] = shtrpd_touchmultiplier2_val;
         /*  Non-trackpad channels Touch Shifter */
-        data_buffer[8] = shtrpd_properties.touchshifter2_val;
+        data_buffer[8] = shtrpd_touchshifter2_val;
         /*  (in-touch) Touch Threshold Multiplier */
         data_buffer[9] = shtrpd_intouchmultiplier_flipclose_val;
     }
@@ -8509,23 +9089,34 @@ static int shtrpd_thresholds_for_flip(struct shtrpd_ts_data *data, u8 enable)
 }
 
 /* ------------------------------------------------------------------------- */
-/* shtrpd_switch_event_mode_for_flip                                         */
+/* shtrpd_user_switch_event_mode                                             */
 /* ------------------------------------------------------------------------- */
-static int shtrpd_switch_event_mode_for_flip(struct shtrpd_ts_data *data, u8 enable)
+static int shtrpd_user_switch_event_mode(struct shtrpd_ts_data *data, u8 enable)
 {
     int ret;
-    u8 data_buffer[3];
+    u8 data_buffer[4];
 
     if(enable) {
         /*  ControlSettings0 */
         data_buffer[0] = shtrpd_properties.controlsetting_val[0] | EVENT_MODE | AUTO_MODES;
         /*  ControlSettings1    */
-        data_buffer[1] = shtrpd_properties.controlsetting_val[1] | LOW_POWER;
+        if(shtrpd_touchcruiser_state){
+            data_buffer[1] = shtrpd_properties.controlsetting_val[1] | LOW_POWER;
+        }else{
+            data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT | LOW_POWER;
+        }
         /*  ControlSettings2(add)    */
         if(shtrpd_atic_adj_disable)
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE | PM_RE_ATI | NM_RE_ATI;
         else
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | PM_RE_ATI | NM_RE_ATI;
+
+        if(shtrpd_temp_drift)
+            data_buffer[2] |= TEMP_DRIFT_MODE;
+        
+        /*  ControlSettings3(add)    */
+        data_buffer[3] = shtrpd_properties.controlsetting_val[3];
+
     } else {
         /*  ControlSettings0 */
         data_buffer[0] = shtrpd_properties.controlsetting_val[0] | EVENT_MODE | AUTO_MODES;
@@ -8536,31 +9127,48 @@ static int shtrpd_switch_event_mode_for_flip(struct shtrpd_ts_data *data, u8 ena
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE;
         else
             data_buffer[2] = shtrpd_properties.controlsetting_val[2];
+
+        if(shtrpd_temp_drift)
+            data_buffer[2] |= TEMP_DRIFT_MODE;
+        
+        /*  ControlSettings3(add)    */
+        data_buffer[3] = shtrpd_properties.controlsetting_val[3];
     }
 
     /*  Switch Event/Streaming Mode */
-    ret = shtrpd_i2c_user_write_block_data(data->client, CONTROL_SETTINGS, 3, data_buffer);
+    ret = shtrpd_i2c_user_write_block_data(data->client, CONTROL_SETTINGS, 4, data_buffer);
     return ret;
 }
 
 /* ------------------------------------------------------------------------- */
-/* shtrpd_change_normal_mode_for_flip                                        */
+/* shtrpd_user_change_normal_mode                                            */
 /* ------------------------------------------------------------------------- */
-static int shtrpd_change_normal_mode_for_flip(struct shtrpd_ts_data *data, u8 enable)
+static int shtrpd_user_change_normal_mode(struct shtrpd_ts_data *data, u8 enable)
 {
     int ret;
-    u8 data_buffer[3];
+    u8 data_buffer[4];
 
     if(enable) {
         /*  ControlSettings0 */
         data_buffer[0] = shtrpd_properties.controlsetting_val[0] | EVENT_MODE;
         /*  ControlSettings1    */
-        data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+        if(shtrpd_touchcruiser_state){
+            data_buffer[1] = shtrpd_properties.controlsetting_val[1];
+        }else{
+            data_buffer[1] = shtrpd_properties.controlsetting_val[1] | DIS_TOUCH_EVENT;
+        }
         /*  ControlSettings2(add)    */
         if(shtrpd_atic_adj_disable)
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE | PM_RE_ATI | NM_RE_ATI;
         else
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | PM_RE_ATI | NM_RE_ATI;
+
+        if(shtrpd_temp_drift)
+            data_buffer[2] |= TEMP_DRIFT_MODE;
+        
+        /*  ControlSettings3(add)    */
+        data_buffer[3] = shtrpd_properties.controlsetting_val[3];
+
     } else {
         /*  ControlSettings0 */
         data_buffer[0] = shtrpd_properties.controlsetting_val[0] | EVENT_MODE;
@@ -8571,10 +9179,16 @@ static int shtrpd_change_normal_mode_for_flip(struct shtrpd_ts_data *data, u8 en
             data_buffer[2] = shtrpd_properties.controlsetting_val[2] | ATIC_ADJ_DISABLE;
         else
             data_buffer[2] = shtrpd_properties.controlsetting_val[2];
+
+        if(shtrpd_temp_drift)
+            data_buffer[2] |= TEMP_DRIFT_MODE;
+        
+        /*  ControlSettings3(add)    */
+        data_buffer[3] = shtrpd_properties.controlsetting_val[3];
     }
 
     /*  Switch Event/Streaming Mode */
-    ret = shtrpd_i2c_user_write_block_data(data->client, CONTROL_SETTINGS, 3, data_buffer);
+    ret = shtrpd_i2c_user_write_block_data(data->client, CONTROL_SETTINGS, 4, data_buffer);
     return ret;
 }
 
@@ -8615,33 +9229,38 @@ static void shtrpd_flip_open(struct work_struct *work)
 
     shtrpd_sys_enable_irq();
 
-    ret = shtrpd_change_normal_mode_for_flip(data, 0);
+    ret = shtrpd_user_change_normal_mode(data, 0);
     if(ret < 0){
         SHTRPD_ERR("shtrpd_change_normal_mode err, ret:%d\n", ret)
         goto reset;
     }
 
-    ret = shtrpd_timing_settings_for_flip(data, 1);
+    ret = shtrpd_user_timing_settings(data, 1);
     if(ret < 0) {
-        SHTRPD_ERR("shtrpd_timing_settings_for_flip err, ret:%d\n", ret);
+        SHTRPD_ERR("shtrpd_user_timing_settings err, ret:%d\n", ret);
         goto reset;
     }
 
 #if defined( SHTRPD_CHECK_CPU_TEMP_ENABLE )
-    ret = shtrpd_thresholds_check_cpu_temp(data);
+    if(SHTRPD_CHECK_CPU_TEMP){
+        SHTRPD_LOG_CHECK_CPU_TEMP("cpu temp check timer start\n");
+        cancel_delayed_work(&shtrpd_work_cpu_temp);
+        queue_delayed_work(shtrpd_work_queue, &shtrpd_work_cpu_temp, msecs_to_jiffies(SHTRPD_CHECK_CPU_TEMP_INTERVAL));
+    }
+    ret = shtrpd_thresholds_check_cpu_temp(1);
     if(ret < 0) {
         SHTRPD_ERR("shtrpd_thresholds_check_cpu_temp err, ret:%d\n", ret);
         goto reset;
     }
 #else /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
-    ret = shtrpd_thresholds_for_flip(data, 1);
+    ret = shtrpd_user_thresholds(data, 1);
     if(ret < 0) {
-        SHTRPD_ERR("shtrpd_thresholds_for_flip err, ret:%d\n", ret);
+        SHTRPD_ERR("shtrpd_user_thresholds err, ret:%d\n", ret);
         goto reset;
     }
 #endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
 
-    ret = shtrpd_switch_event_mode_for_flip(data, 1);
+    ret = shtrpd_user_switch_event_mode(data, 1);
     if(ret < 0) {
         SHTRPD_ERR("shtrpd_switch_event_mode err, ret:%d\n", ret);
         goto reset;
@@ -8691,25 +9310,25 @@ static int shtrpd_flip_close_proc(void)
     u8 buffer[40];
     struct shtrpd_ts_data *data = i2c_get_clientdata(shtrpd_client);
 
-    ret = shtrpd_change_normal_mode_for_flip(data, 1);
+    ret = shtrpd_user_change_normal_mode(data, 1);
     if(ret < 0){
         SHTRPD_ERR("shtrpd_change_normal_mode err, ret:%d\n", ret)
         return -1;
     }
 
-    ret = shtrpd_thresholds_for_flip(data, 0);
+    ret = shtrpd_user_thresholds(data, 0);
     if(ret < 0){
-        SHTRPD_ERR("shtrpd_thresholds_for_flip err, ret:%d\n", ret)
+        SHTRPD_ERR("shtrpd_user_thresholds err, ret:%d\n", ret)
         return -1;
     }
 
-    ret = shtrpd_timing_settings_for_flip(data, 0);
+    ret = shtrpd_user_timing_settings(data, 0);
     if(ret < 0){
-        SHTRPD_ERR("shtrpd_timing_settings_for_flip err, ret:%d\n", ret)
+        SHTRPD_ERR("shtrpd_user_timing_settings err, ret:%d\n", ret)
         return -1;
     }
 
-    ret = shtrpd_switch_event_mode_for_flip(data, 0);
+    ret = shtrpd_user_switch_event_mode(data, 0);
     if(ret < 0){
         SHTRPD_ERR("shtrpd_disable_event_mode err, ret:%d\n", ret)
         return -1;
@@ -8736,6 +9355,11 @@ static void shtrpd_flip_close(struct work_struct *work)
     shtrpd_flip_state = 0;
 
     SHTRPD_DBG("start\n");
+
+#if defined( SHTRPD_CHECK_CPU_TEMP_ENABLE )
+    SHTRPD_LOG_CHECK_CPU_TEMP("cpu temp check timer stop\n");
+    cancel_delayed_work(&shtrpd_work_cpu_temp);
+#endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
 
 #if defined(SHTRPD_SNAP_USER_MASK)
     if(SHTRPD_SNAP_USER_MASK_CLEAR_IN_FLIP){
@@ -9331,7 +9955,7 @@ static int shtrpd_ts_probe(struct i2c_client *client,
         INIT_WORK(&shtrpd_work_flip_open, shtrpd_flip_open);
         INIT_WORK(&shtrpd_work_flip_close, shtrpd_flip_close);
 #if defined( SHTRPD_CHECK_CPU_TEMP_ENABLE )
-        INIT_WORK(&shtrpd_work_cpu_temp, shtrpd_check_cpu_temp_func);
+        INIT_DELAYED_WORK(&shtrpd_work_cpu_temp, shtrpd_check_cpu_temp_func);
 #endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
 #if defined( SHTRPD_TOUCH_UP_DELAY_ENABLE )
         INIT_DELAYED_WORK(&shtrpd_work_tu_delay, shtrpd_tu_delay_func);
@@ -9388,6 +10012,10 @@ static int shtrpd_ts_probe(struct i2c_client *client,
         entry->write_proc = shtrpd_proc_write;
     }
 #endif /* #ifdef CONFIG_ANDROID_ENGINEERING */
+
+#if defined(SHTRPD_CHECK_CPU_TEMP_ENABLE) && defined(CONFIG_ANDROID_ENGINEERING)
+    shtrpd_snapdebug_init();
+#endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE && CONFIG_ANDROID_ENGINEERING */
 
     return 0;
 
@@ -9466,6 +10094,11 @@ static int shtrpd_ts_suspend(struct i2c_client *client, pm_message_t mesg)
         shtrpd_sys_enable_irq_wake();
     }
 
+#if defined( SHTRPD_CHECK_CPU_TEMP_ENABLE )
+    SHTRPD_LOG_CHECK_CPU_TEMP("cpu temp check timer stop\n");
+    cancel_delayed_work(&shtrpd_work_cpu_temp);
+#endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
+
     return 0;
 }
 
@@ -9497,8 +10130,10 @@ static int shtrpd_ts_resume(struct i2c_client *client)
     if(shtrpd_flip_state) {
         shtrpd_sys_enable_irq();
 #if defined( SHTRPD_CHECK_CPU_TEMP_ENABLE )
-        if (shtrpd_work_queue) {
-            queue_work(shtrpd_work_queue, &shtrpd_work_cpu_temp);
+        if(SHTRPD_CHECK_CPU_TEMP){
+	        SHTRPD_LOG_CHECK_CPU_TEMP("cpu temp check timer start\n");
+            cancel_delayed_work(&shtrpd_work_cpu_temp);
+            queue_delayed_work(shtrpd_work_queue, &shtrpd_work_cpu_temp, msecs_to_jiffies(0));
         }
 #endif /* SHTRPD_CHECK_CPU_TEMP_ENABLE */
     }

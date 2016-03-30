@@ -258,6 +258,12 @@ static const shbattlog_disp_type event_str[] =
      {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
      {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
      {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
+     {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
+     {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
+     {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
+     {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
+     {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
+     {1,1,0,0,1,1,0,0,0,0,0,0,0,1,0},
      {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}};
 
 typedef struct {
@@ -286,7 +292,7 @@ static struct semaphore shterm_flip_sem;
 
 static int shterm_info[SHTERM_MAX];
 static int shterm_info_read[SHTERM_MAX];
-static int shterm_flip_status = SHTERM_FLIP_STATE_CLOSE;
+static int shterm_flip_status = SHTERM_FLIP_STATE_OPEN;
 static unsigned long int flip_counter = 0;
 static int shterm_old_lmk_bit = 0;
 
