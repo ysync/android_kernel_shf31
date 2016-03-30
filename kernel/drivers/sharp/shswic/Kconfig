@@ -1,0 +1,23 @@
+# drivers/sharp/shswic/Kconfig
+
+menu "SWIC Device Drivers"
+
+config USB_SWIC
+	bool "USB switch IC Driver"
+
+config AC_ADAPTER_SWIC
+	bool "AC_ADAPTER switch IC Driver"
+
+config IRREGULAR_CHARGER_SWIC
+	bool "IRREGULAR_CHARGER switch IC Driver"
+
+config CRADLE_SWIC
+	bool "CRADLE switch IC Driver"
+
+config HOST_SWIC
+	bool "HOST switch IC Driver"
+
+config HEADSET_BUTTON_SWIC
+	bool "HEADSET BUTTON enable IC Driver"
+
+endmenu

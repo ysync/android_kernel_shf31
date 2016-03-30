@@ -1,0 +1,9 @@
+# drivers/sharp/shkeyled/Kconfig
+
+menu "SHARP KEYLED Device Drivers"
+
+config LEDS_KEY_LED
+	bool "SHARP KEYLED Device Drivers"
+	default n
+
+endmenu

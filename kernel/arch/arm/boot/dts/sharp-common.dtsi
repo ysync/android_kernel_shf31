@@ -1,0 +1,282 @@
+/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+/include/ "sharp-common-sdcc.dtsi"
+
+/*----------------------------------------*/
+/* Delete Qualcomm settings.              */
+/*----------------------------------------*/
+/ {
+	aliases {
+		/delete-property/ spi0;
+	};
+
+	soc {
+		/delete-node/ spi@f9923000;
+		/delete-node/ i2c@f9925000;
+		/delete-node/ i2c@f9926000;
+		/delete-node/ i2c@f9927000;
+	};
+};
+
+&soc {
+	/*****************************************/
+	/*  BLSP1                                */
+	/*****************************************/
+
+	/*---------------------*/
+	/* BLSP1 QUP0(BLSP#1)  */
+	/* 0xf991d000          */
+	/* 0xf9923000          */
+	/*---------------------*/
+	/* This is for IRDA, please IRDA team support */
+	serial@f991d000 {
+		compatible = "qcom,msm-lsuart-v14";
+		reg = <0xf991d000 0x1000>;
+		interrupts = <0 107 0>;
+		qcom,config-gpio = <1>;
+		qcom,tx-gpio = <&msmgpio 0 0>;
+		qcom,rx-gpio = <&msmgpio 1 0>;
+		qcom,use-pm;
+
+		status = "disabled";
+	};
+
+	/* This is I2C for LED driver and Ceramic speaker driver, please LED driver and Audio team support */
+	i2c@f9923000 {
+		cell-index = <1>;
+		compatible = "qcom,i2c-qup";
+		reg = <0xf9923000 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		reg-names = "qup_phys_addr";
+		interrupts = <0 95 0>;
+		interrupt-names = "qup_err_intr";
+		qcom,i2c-bus-freq = <384000>;
+		qcom,i2c-src-freq = <19200000>;
+		qcom,clk-ctl-xfer;
+		qcom,sda-gpio = <&msmgpio 2 0>;
+		qcom,scl-gpio = <&msmgpio 3 0>;
+		qcom,master-id = <86>;
+
+		status = "disabled";
+/* => SH_AUDIO_DRIVER 08-004 */
+		shreceiver@6f {
+			compatible = "sharp,shreceiver_i2c";
+			sharp,shreceiver-en-gpio = <&msmgpio 22 0>;
+			reg = <0x6f>;
+			status = "ok";
+		};
+/* <= SH_AUDIO_DRIVER 08-004 */
+
+	felica_cen@57 {
+            status = "ok";
+            compatible = "sharp,felica_cen";
+            reg = <0x57>;
+           interrupt-parent = <&msmgpio>;
+        };
+	};
+
+	/*---------------------*/
+	/* BLSP1 QUP1(BLSP#2)  */
+	/* 0xf991e000          */
+	/* 0xf9924000          */
+	/*---------------------*/
+	/* This is for Felica Uart, please Felica Uart team support */
+	serial@f991e000 {
+		compatible = "qcom,msm-lsuart-v14";
+		reg = <0xf991e000 0x1000>;
+		interrupts = <0 108 0>;
+		qcom,config-gpio = <1>;
+		qcom,tx-gpio = <&msmgpio 4 0>;
+		qcom,rx-gpio = <&msmgpio 5 0>;
+		qcom,use-pm;
+
+		status = "disabled";
+	};
+
+	/* This is I2C for acceleration and geomagnetic sensors */
+	i2c@f9924000 {
+		cell-index = <2>;
+		compatible = "qcom,i2c-qup";
+		reg = <0xf9924000 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		reg-names = "qup_phys_addr";
+		interrupts = <0 96 0>;
+		interrupt-names = "qup_err_intr";
+		qcom,i2c-bus-freq = <384000>;
+		qcom,i2c-src-freq = <19200000>;
+		qcom,clk-ctl-xfer;
+		qcom,sda-gpio = <&msmgpio 6 0>;
+		qcom,scl-gpio = <&msmgpio 7 0>;
+		qcom,master-id = <86>;
+
+		status = "disabled";
+		/*TS add motion sensor S*/
+		akm8963@0C {
+			status = "ok";
+			reg = <0x0C>;
+			compatible = "ak,akm8963";
+		};
+
+		lis2dh@18 {
+			status = "ok";
+			reg = <0x18>;
+			compatible = "st,lis2dh_acc";
+			interrupts = <63 0x1>;
+			orientation = <1 0 0
+						   0 1 0
+						   0 0 1>;
+		};
+		/*TS add motion sensor E*/
+	};
+
+	/*---------------------*/
+	/* BLSP1 QUP2(BLSP#3)  */
+	/* 0xf991f000          */
+	/* 0xf9925000          */
+	/*---------------------*/
+	/* This is SPI for Digital 1-seg TV */
+	spi@f9925000 {
+		compatible = "qcom,spi-qup-v2";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		reg-names = "spi_physical", "spi_bam_physical";
+		reg = <0xf9925000 0x1000>,
+		      <0xf9904000 0x19000>;
+		interrupt-names = "spi_irq", "spi_bam_irq";
+		interrupts = <0 97 0>, <0 238 0>;
+		spi-max-frequency = <50000000>;
+
+		qcom,gpio-mosi = <&msmgpio 8 0>;
+		qcom,gpio-miso = <&msmgpio 9 0>;
+/*		qcom,gpio-cs0  = <&msmgpio 10 0>;*/
+		qcom,gpio-cs0  = <>;
+/*		qcom,gpio-cs1  = <&msmgpio 110 0>;*/
+/*		qcom,gpio-cs2  = <&msmgpio 111 0>;*/
+/*		qcom,gpio-cs3  = <&msmgpio 112 0>;*/
+		qcom,gpio-clk  = <&msmgpio 11 0>;
+
+		qcom,infinite-mode = <0>;
+		qcom,use-bam;
+		qcom,ver-reg-exists;
+		qcom,bam-consumer-pipe-index = <16>;
+		qcom,bam-producer-pipe-index = <17>;
+		qcom,master-id = <86>;
+
+		status = "disabled";
+
+		shdtv_spi@0 {
+			status = "ok";
+			compatible = "sharp,shdtv_spi";
+			reg = <0>;
+			spi-max-frequency = <20000000>;
+/*			spi-cpol; */
+/*			spi-cpha; */
+		};
+
+	};
+
+	/*---------------------*/
+	/* BLSP1 QUP3(BLSP#4)  */
+	/* 0xf9926000          */
+	/* 0xf9920000          */
+	/*---------------------*/
+	/* This is I2C for Key-IF, please Key team support */
+	i2c@f9926000 {	/* msm8926 override */
+		cell-index = <4>;
+		compatible = "qcom,i2c-qup";
+		reg = <0xf9926000 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		reg-names = "qup_phys_addr";
+		interrupts = <0 98 0>;
+		interrupt-names = "qup_err_intr";
+/*		qcom,i2c-bus-freq = <100000>; */
+		qcom,i2c-bus-freq = <384000>;
+		qcom,i2c-src-freq = <19200000>;
+		qcom,clk-ctl-xfer;
+		qcom,sda-gpio = <&msmgpio 14 0>;
+		qcom,scl-gpio = <&msmgpio 15 0>;
+
+		status = "disabled";
+	};
+
+	/*---------------------*/
+	/* BLSP1 QUP4(BLSP#5)  */
+	/* 0xf9927000          */
+	/* 0xf9921000          */
+	/*---------------------*/
+	/* This is SPI for Touch panel / EL, please Touch panel team support */
+	spi@f9927000 {
+		compatible = "qcom,spi-qup-v2";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		reg-names = "spi_physical", "spi_bam_physical";
+		reg = <0xf9927000 0x1000>,
+		      <0xf9904000 0xF000>;
+		interrupt-names = "spi_irq", "spi_bam_irq";
+		interrupts = <0 99 0>, <0 238 0>;
+		spi-max-frequency = <50000000>;
+
+		qcom,gpio-mosi = <&msmgpio 16 0>;
+/*		qcom,gpio-miso = <&msmgpio 17 0>;*/
+/*		qcom,gpio-cs0  = <&msmgpio 18 0>;*/
+		qcom,gpio-cs0  = <>;
+		qcom,gpio-clk  = <&msmgpio 19 0>;
+
+		qcom,infinite-mode = <0>;
+/*		qcom,use-bam;*/
+		qcom,ver-reg-exists;
+		qcom,bam-consumer-pipe-index = <20>;
+		qcom,bam-producer-pipe-index = <21>;
+		qcom,master-id = <86>;
+
+		status = "disabled";
+
+	};
+
+	/*---------------------*/
+	/* BLSP1 QUP5(BLSP#6)  */
+	/* 0xf9928000          */
+	/* 0xf9922000          */
+	/*---------------------*/
+
+
+
+
+	/*---------------------*/
+	/* UNKNOWN             */
+	/*---------------------*/
+	serial@f995e000 {	/* msm8926 override */
+		compatible = "qcom,msm-lsuart-v14";
+		reg = <0xf995e000 0x1000>;
+		interrupts = <0 114 0>;
+
+		status = "disabled";
+	};
+
+};
+
+/* => SH_AUDIO_DRIVER 08-001 */
+&slim_msm {
+        tapan_codec {
+                qcom,cdc-micbias1-ext-cap;
+        };
+};
+/* <= SH_AUDIO_DRIVER 08-001 */
+
+/*****************************************/
+/*  PM8x26                               */
+/*****************************************/
+/include/ "sharp-common-pm8226.dtsi"

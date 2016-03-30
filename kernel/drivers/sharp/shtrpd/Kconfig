@@ -1,0 +1,8 @@
+# drivers/sharp/shtrpd/Kconfig
+
+menu "SHARP TrackPad Drivers"
+
+config TRACKPAD_SHTRPD
+	bool "TrackPad Driver"
+
+endmenu

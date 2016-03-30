@@ -1,0 +1,11 @@
+menuconfig SHMDS
+	bool "Motion Sensor Drivers"
+	default y
+
+if SHMDS
+source "drivers/sharp/shmds/motionsensor/Kconfig"
+source "drivers/sharp/shmds/mpu6515/Kconfig"
+source "drivers/sharp/shmds/mpu6515/inv_test/Kconfig"
+
+endif
+

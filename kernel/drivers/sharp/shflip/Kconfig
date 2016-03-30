@@ -1,0 +1,9 @@
+# drivers/sharp/shkeyled/Kconfig
+
+menu "SHARP FLIP Device Drivers"
+
+config FLIP_SWITCH
+	bool "SHARP FLIP Device Drivers"
+	default n
+
+endmenu
